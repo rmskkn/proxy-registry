@@ -1,0 +1,9 @@
+listen = :5000
+#cache-dir = ~/registry-proxy/cache
+aria2-path = aria2c
+aria2-rpc-port = 6880
+aria2-connections = 16
+aria2-min-split-size = 5M
+min-aria2-size = 1048576
+http-timeout = 30s
+#insecure-registries = my.registry:5000,another:5000

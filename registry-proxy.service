@@ -1,0 +1,13 @@
+[Unit]
+Description=registry-proxy - universal HTTP pull-through proxy
+After=network-online.target
+
+[Service]
+ExecStart=__BIN__
+WorkingDirectory=__WORKDIR__
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,306 @@
+package proxy
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os/exec"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"registry-proxy/internal/aria2"
+	"registry-proxy/internal/cache"
+	"registry-proxy/internal/config"
+)
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func hostPort(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parsing %q: %v", srv.URL, err)
+	}
+	return u.Host
+}
+
+func newTestProxy(t *testing.T, insecureHosts ...string) (*Proxy, *httptest.Server) {
+	t.Helper()
+	c, err := cache.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		HTTPTimeout:        5 * time.Second,
+		MinAria2Size:       1 << 30, // default to "always direct-fetch" unless a test overrides it
+		Aria2MinSplit:      "1M",
+		InsecureRegistries: insecureHosts,
+	}
+	p := New(cfg, c, nil)
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	return p, srv
+}
+
+func TestProxyPing(t *testing.T) {
+	_, srv := newTestProxy(t)
+	resp, err := http.Get(srv.URL + "/v2/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestProxyManifestPassthrough(t *testing.T) {
+	const manifestBody = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`
+	var gotAccept string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccept = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex([]byte(manifestBody)))
+		w.Write([]byte(manifestBody))
+	}))
+	defer upstream.Close()
+
+	_, srv := newTestProxy(t, hostPort(t, upstream))
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/"+hostPort(t, upstream)+"/myrepo/manifests/latest", nil)
+	req.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != manifestBody {
+		t.Errorf("body = %q, want %q", body, manifestBody)
+	}
+	if gotAccept != "application/vnd.oci.image.manifest.v1+json" {
+		t.Errorf("upstream saw Accept=%q", gotAccept)
+	}
+	if resp.Header.Get("Docker-Content-Digest") == "" {
+		t.Error("Docker-Content-Digest not forwarded")
+	}
+}
+
+// blobUpstream stands in for a registry (redirects blob GET/HEAD to a
+// separate storage server) plus the storage server itself, mimicking how
+// Docker Hub and similar registries offload blobs to a CDN.
+type blobUpstream struct {
+	registry *httptest.Server
+	storage  *httptest.Server
+	digest   string
+	hits     int32 // storage hits
+}
+
+func newBlobUpstream(t *testing.T, content []byte) *blobUpstream {
+	t.Helper()
+	b := &blobUpstream{digest: "sha256:" + sha256Hex(content)}
+
+	b.storage = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&b.hits, 1)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(content)
+	}))
+	t.Cleanup(b.storage.Close)
+
+	b.registry = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, b.storage.URL+"/blob-data", http.StatusMovedPermanently)
+	}))
+	t.Cleanup(b.registry.Close)
+	return b
+}
+
+func TestProxyBlobDirectFetchAndCache(t *testing.T) {
+	content := []byte("small blob content, well under the aria2 threshold")
+	up := newBlobUpstream(t, content)
+	p, srv := newTestProxy(t, hostPort(t, up.registry))
+
+	blobURL := srv.URL + "/v2/" + hostPort(t, up.registry) + "/x/blobs/" + up.digest
+	resp, err := http.Get(blobURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != string(content) {
+		t.Errorf("body = %q, want %q", body, content)
+	}
+	if got := resp.Header.Get("Docker-Content-Digest"); got != up.digest {
+		t.Errorf("Docker-Content-Digest = %q, want %q", got, up.digest)
+	}
+	if !p.cache.Has(up.digest) {
+		t.Error("blob not committed to cache after fetch")
+	}
+}
+
+func TestProxyBlobDigestMismatchRejected(t *testing.T) {
+	realContent := []byte("this is the real content")
+	wrongContent := []byte("this is NOT what the digest says")
+
+	up := newBlobUpstream(t, realContent)
+	// Point storage at content that doesn't match up.digest.
+	up.storage.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(wrongContent)))
+		if r.Method != http.MethodHead {
+			w.Write(wrongContent)
+		}
+	})
+
+	_, srv := newTestProxy(t, hostPort(t, up.registry))
+	blobURL := srv.URL + "/v2/" + hostPort(t, up.registry) + "/x/blobs/" + up.digest
+	resp, err := http.Get(blobURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 on digest mismatch", resp.StatusCode)
+	}
+}
+
+func TestProxyBlobHeadServedFromCacheWithoutUpstream(t *testing.T) {
+	content := []byte("cached blob for HEAD test")
+	up := newBlobUpstream(t, content)
+	p, srv := newTestProxy(t, hostPort(t, up.registry))
+
+	digestURL := srv.URL + "/v2/" + hostPort(t, up.registry) + "/x/blobs/" + up.digest
+	if resp, err := http.Get(digestURL); err != nil {
+		t.Fatal(err)
+	} else {
+		resp.Body.Close()
+	}
+	if !p.cache.Has(up.digest) {
+		t.Fatal("precondition failed: blob should be cached")
+	}
+
+	// Kill the registry so any HEAD that actually reaches upstream fails loudly.
+	up.registry.Close()
+
+	resp, err := http.Head(digestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200 (served from cache)", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Length"); got != fmt.Sprintf("%d", len(content)) {
+		t.Errorf("Content-Length = %q, want %d", got, len(content))
+	}
+}
+
+func TestProxyBlobSingleflightDedupesConcurrentFetches(t *testing.T) {
+	content := []byte("deduped concurrent blob fetch content")
+	up := newBlobUpstream(t, content)
+	_, srv := newTestProxy(t, hostPort(t, up.registry))
+
+	blobURL := srv.URL + "/v2/" + hostPort(t, up.registry) + "/x/blobs/" + up.digest
+
+	var wg sync.WaitGroup
+	results := make([]string, 8)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := http.Get(blobURL)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			results[i] = string(body)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, got := range results {
+		if got != string(content) {
+			t.Errorf("caller %d got %q, want %q", i, got, content)
+		}
+	}
+	// The storage server (final hop) should only have been hit once for the
+	// GET (plus once for the HEAD resolution before the singleflight'd fetch).
+	if hits := atomic.LoadInt32(&up.hits); hits > 2 {
+		t.Errorf("storage hit %d times, want at most 2 (one HEAD + one GET) despite %d concurrent callers", hits, len(results))
+	}
+}
+
+func TestProxyBlobAria2Fetch(t *testing.T) {
+	if _, err := exec.LookPath("aria2c"); err != nil {
+		t.Skip("aria2c not found in PATH, skipping aria2-backed fetch test")
+	}
+
+	// Large enough to be unambiguous, small enough to keep the test fast.
+	content := make([]byte, 2*1024*1024)
+	for i := range content {
+		content[i] = byte(i % 251)
+	}
+	up := newBlobUpstream(t, content)
+
+	c, err := cache.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		HTTPTimeout:        5 * time.Second,
+		MinAria2Size:       1024, // force the aria2 path
+		Aria2Path:          "aria2c",
+		Aria2RPCPort:       16880,
+		Aria2Connections:   4,
+		Aria2MinSplit:      "1M",
+		InsecureRegistries: []string{hostPort(t, up.registry)},
+	}
+	a, err := aria2.Start(cfg)
+	if err != nil {
+		t.Fatalf("aria2.Start: %v", err)
+	}
+	t.Cleanup(a.Stop)
+
+	p := New(cfg, c, a)
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+
+	blobURL := srv.URL + "/v2/" + hostPort(t, up.registry) + "/x/blobs/" + up.digest
+	resp, err := http.Get(blobURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := sha256Hex(body); got != up.digest[len("sha256:"):] {
+		t.Errorf("downloaded content digest mismatch: got sha256:%s want %s", got, up.digest)
+	}
+	if len(body) != len(content) {
+		t.Errorf("downloaded %d bytes, want %d", len(body), len(content))
+	}
+}
