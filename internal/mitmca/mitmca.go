@@ -37,69 +37,25 @@ func CertPath(dir string) string { return filepath.Join(dir, "ca-cert.pem") }
 
 func keyPath(dir string) string { return filepath.Join(dir, "ca-key.pem") }
 
-// LoadOrCreate loads a root CA from dir, generating and persisting one if
-// none exists yet. The second return value reports whether a new CA was
-// generated, so the caller can prompt for trust-store installation.
-func LoadOrCreate(dir string) (ca *CA, created bool, err error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, false, err
-	}
+// Load reads a root CA from dir. The CA must already exist there as
+// ca-cert.pem / ca-key.pem (see README for generating one with openssl) -
+// this package never generates one itself.
+func Load(dir string) (*CA, error) {
 	cp, kp := CertPath(dir), keyPath(dir)
 
-	if certPEM, err := os.ReadFile(cp); err == nil {
-		keyPEM, err := os.ReadFile(kp)
-		if err != nil {
-			return nil, false, err
-		}
-		cert, key, err := decode(certPEM, keyPEM)
-		if err != nil {
-			return nil, false, err
-		}
-		return &CA{cert: cert, key: key, leafs: map[string]*tls.Certificate{}}, false, nil
-	}
-
-	cert, key, certPEM, keyPEM, err := generateRoot()
+	certPEM, err := os.ReadFile(cp)
 	if err != nil {
-		return nil, false, err
+		return nil, fmt.Errorf("reading CA certificate %s (generate one with openssl and place it here - see README): %w", cp, err)
 	}
-	if err := os.WriteFile(kp, keyPEM, 0o600); err != nil {
-		return nil, false, err
-	}
-	if err := os.WriteFile(cp, certPEM, 0o644); err != nil {
-		return nil, false, err
-	}
-	return &CA{cert: cert, key: key, leafs: map[string]*tls.Certificate{}}, true, nil
-}
-
-func generateRoot() (*x509.Certificate, *rsa.PrivateKey, []byte, []byte, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	keyPEM, err := os.ReadFile(kp)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, fmt.Errorf("reading CA key %s (generate one with openssl and place it here - see README): %w", kp, err)
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	cert, key, err := decode(certPEM, keyPEM)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "registry-proxy local CA", Organization: []string{"registry-proxy"}},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().AddDate(10, 0, 0),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	return cert, key, certPEM, keyPEM, nil
+	return &CA{cert: cert, key: key, leafs: map[string]*tls.Certificate{}}, nil
 }
 
 func decode(certPEM, keyPEM []byte) (*x509.Certificate, *rsa.PrivateKey, error) {

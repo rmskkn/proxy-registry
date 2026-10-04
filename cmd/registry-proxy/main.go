@@ -40,12 +40,9 @@ func run(cfg *config.Config) error {
 
 	var tlsConfig *tls.Config
 	if cfg.MITM {
-		ca, created, err := mitmca.LoadOrCreate(cfg.CADir)
+		ca, err := mitmca.Load(cfg.CADir)
 		if err != nil {
 			return fmt.Errorf("loading MITM CA: %w", err)
-		}
-		if created {
-			log.Printf("generated local MITM CA at %s - install it into every client's trust store before pointing clients at this proxy over HTTPS", mitmca.CertPath(cfg.CADir))
 		}
 		tlsConfig = &tls.Config{GetCertificate: ca.GetCertificate}
 	}

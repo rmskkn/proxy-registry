@@ -171,10 +171,10 @@ path-based.
 
 ## Transparent HTTPS (MITM)
 
-**Security-relevant, opt-in.** This installs a locally-generated root CA
-into a client's trust store. Anything that trusts that CA will accept
-certificates it signs for *any* hostname - only do this on machines you
-control, and only point hosts you trust through it.
+**Security-relevant, opt-in.** This installs a self-signed root CA, which
+*you* generate and provide, into a client's trust store. Anything that
+trusts that CA will accept certificates it signs for *any* hostname - only
+do this on machines you control, and only point hosts you trust through it.
 
 With this enabled, redirecting a host to the proxy - via `/etc/hosts` or an
 iptables rule - makes a plain, unmodified request work with no per-call
@@ -195,8 +195,25 @@ mitm-tls = true
 ca-dir = ~/registry-proxy/ca
 ```
 
-On first start, the proxy generates a root CA under `ca-dir` and logs its
-path. Install that certificate into the trust store of every client you
+The proxy does **not** generate this CA itself - it only loads one you
+already placed in `ca-dir` as `ca-cert.pem` / `ca-key.pem`. Start without
+both files present and it fails to start, naming the missing file.
+
+### Generating the CA
+
+Generate a root CA with openssl and write it to `ca-dir`:
+
+```sh
+mkdir -p ~/registry-proxy/ca
+openssl req -x509 -newkey rsa:2048 -sha256 -days 360 -nodes \
+  -keyout ~/registry-proxy/ca/ca-key.pem \
+  -out ~/registry-proxy/ca/ca-cert.pem \
+  -subj "/CN=registry-proxy local CA/O=registry-proxy" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature"
+```
+
+Then install that certificate into the trust store of every client you
 want this to work for:
 
 ```sh
