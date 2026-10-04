@@ -42,6 +42,15 @@ Manifests and tag listings are passed through unmodified and uncached.
 ## Requirements
 
 - `aria2c` (package `aria2`)
+- Go 1.22+ (to build from source)
+
+```sh
+# Debian/Ubuntu
+sudo apt install aria2 golang-go
+
+# Arch Linux
+sudo pacman -S aria2 go
+```
 
 ## Config file
 
@@ -72,6 +81,12 @@ insecure-registries = my.registry:5000,another:5000
 | `min-aria2-size` | `1048576` | Blobs smaller than this bypass aria2 |
 | `http-timeout` | `30s` | Timeout for manifest/tag/HEAD requests |
 | `insecure-registries` | (none) | Comma-separated hosts to contact over plain HTTP; `*` for all |
+
+## Build
+
+```sh
+go build -o registry-proxy ./cmd/registry-proxy
+```
 
 ## Installation
 
