@@ -63,17 +63,19 @@ listen = :5000
 cache-dir = /var/cache/registry-proxy
 aria2-path = aria2c
 aria2-rpc-port = 6880
-aria2-connections = 32
+aria2-connections = 16
 aria2-min-split-size = 5M
 min-aria2-size = 1048576
 http-timeout = 30s
 insecure-registries = my.registry:5000,another:5000
+mitm-tls = true
+ca-dir = ~/registry-proxy/ca
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
 | `listen` | `:5000` | Address to listen on |
-| `cache-dir` | `./cache` | Blob cache + in-progress downloads |
+| `cache-dir` | `~/registry-proxy/cache` | Blob cache + in-progress downloads |
 | `aria2-path` | `aria2c` | Path to the aria2c binary |
 | `aria2-rpc-port` | `6880` | Local aria2 JSON-RPC port |
 | `aria2-connections` | `16` | Max connections per server for aria2 |
@@ -81,6 +83,8 @@ insecure-registries = my.registry:5000,another:5000
 | `min-aria2-size` | `1048576` | Blobs smaller than this bypass aria2 |
 | `http-timeout` | `30s` | Timeout for manifest/tag/HEAD requests |
 | `insecure-registries` | (none) | Comma-separated hosts to contact over plain HTTP; `*` for all |
+| `mitm-tls` | `false` | Enable transparent-HTTPS CA termination (see below) |
+| `ca-dir` | `./ca` | Directory holding `ca-cert.pem`/`ca-key.pem` for `mitm-tls` |
 
 ## Build
 
@@ -102,11 +106,6 @@ Or manually:
 go build -o registry-proxy ./cmd/registry-proxy
 mkdir -p ~/registry-proxy && echo "cache-dir = /var/cache/registry-proxy" > ~/registry-proxy/config
 ./registry-proxy
-```
-
-```sh
-crane pull localhost:5000/nginx:latest nginx.tar
-crane pull localhost:5000/gcr.io/google-containers/pause:3.9 pause.tar
 ```
 
 ## Using the proxy
@@ -162,23 +161,26 @@ system-wide interception of plain `wget https://example.com/...` calls.
 ### Docker
 
 To avoid prefixing every image with `localhost:5000/`, point the Docker
-daemon at the proxy as a registry mirror. Edit (or create)
-`/etc/docker/daemon.json`:
+daemon at the proxy as a registry mirror:
 
-```json
+```sh
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json <<'EOF'
 {
   "registry-mirrors": ["http://localhost:5000"],
   "insecure-registries": ["localhost:5000"]
 }
-```
-
-Restart Docker:
-
-```sh
+EOF
 sudo systemctl restart docker
 ```
 
-`docker pull nginx` now goes through the proxy automatically. This only
+Verify the mirror is active:
+
+```sh
+docker info --format '{{.RegistryConfig.Mirrors}}'
+```
+
+`docker pull ...` now goes through the proxy automatically. This only
 covers Docker Hub (`docker.io`) - Docker's mirror mechanism doesn't apply to
 other registries. Pulls from `gcr.io`, `quay.io`, etc. still need the
 explicit `localhost:5000/<registry-host>/...` prefix, since routing is
