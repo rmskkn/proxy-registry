@@ -218,31 +218,17 @@ both files present and it fails to start, naming the missing file.
 
 ### Generating the CA
 
-Generate a root CA with openssl and write it to `ca-dir`:
+Run [`generate-ca.sh`](generate-ca.sh) to generate a root CA and write it to
+`ca-dir` (defaults to `~/registry-proxy/ca`, or pass a path as the first
+argument):
 
 ```sh
-mkdir -p ~/registry-proxy/ca
-openssl req -x509 -newkey rsa:2048 -sha256 -days 360 -nodes \
-  -keyout ~/registry-proxy/ca/ca-key.pem \
-  -out ~/registry-proxy/ca/ca-cert.pem \
-  -subj "/CN=registry-proxy local CA/O=registry-proxy" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature"
+./generate-ca.sh
 ```
 
-Then install that certificate into the trust store of every client you
-want this to work for:
+Follow the trust-store install instructions the script prints at the end.
 
-```sh
-# Debian/Ubuntu
-sudo cp ~/registry-proxy/ca/ca-cert.pem /usr/local/share/ca-certificates/registry-proxy.crt
-sudo update-ca-certificates
-
-# Arch Linux
-sudo cp ~/registry-proxy/ca/ca-cert.pem /etc/ca-certificates/trust-source/anchors/registry-proxy.crt
-sudo trust extract-compat
-```
-
+### Auto HTTP/HTTPS localhost port redirection
 The proxy's single listen port serves both protocols - it sniffs the first
 byte of each connection (`0x16` means a TLS `ClientHello`) and dispatches to
 a plain or TLS-terminating handler accordingly. That's what makes it
