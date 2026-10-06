@@ -71,9 +71,16 @@ func decode(certPEM, keyPEM []byte) (*x509.Certificate, *rsa.PrivateKey, error) 
 	if keyBlock == nil {
 		return nil, nil, fmt.Errorf("invalid CA key PEM")
 	}
-	key, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+	if key, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes); err == nil {
+		return cert, key, nil
+	}
+	pkcs8Key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 	if err != nil {
 		return nil, nil, err
+	}
+	key, ok := pkcs8Key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, nil, fmt.Errorf("CA key is not an RSA key")
 	}
 	return cert, key, nil
 }

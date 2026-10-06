@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Builds registry-proxy and populates ~/registry-proxy/config with defaults
-# (without overwriting an existing config).
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,19 +28,11 @@ else
 	cp "$SCRIPT_DIR/config.example" "$CONFIG_FILE"
 fi
 
-SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
-SERVICE_FILE="$SYSTEMD_USER_DIR/registry-proxy.service"
+SERVICE_FILE="/etc/systemd/system/registry-proxy.service"
+SERVICE_TEMPLATE="$SCRIPT_DIR/registry-proxy-mitm.service.in"
+LISTEN_PORT="$(grep -E '^[[:space:]]*listen[[:space:]]*=' "$CONFIG_FILE" | sed -E 's/^[^=]*=[[:space:]]*//; s/.*://')"
 
-if command -v systemctl >/dev/null 2>&1; then
-	mkdir -p "$SYSTEMD_USER_DIR"
-	sed -e "s|__BIN__|$BIN|" -e "s|__WORKDIR__|$SCRIPT_DIR|" \
-		"$SCRIPT_DIR/registry-proxy.service" >"$SERVICE_FILE"
-	systemctl --user daemon-reload
-	echo "systemd user service installed: $SERVICE_FILE"
-	echo "start + persist across logout: loginctl enable-linger \$USER && systemctl --user enable --now registry-proxy"
-	echo "logs: journalctl --user -u registry-proxy -f"
-else
-	echo "systemctl not found; skipping systemd service setup"
-fi
+[ -z "$LISTEN_PORT" ] && echo "Listening port is not declared" && exit 1
 
-echo "done. run: $BIN"
+sed -e "s|__BIN__|$BIN|" -e "s|__WORKDIR__|$SCRIPT_DIR|" -e "s|__PORT__|$LISTEN_PORT|" -e "s|__HOME__|$HOME|" "$SERVICE_TEMPLATE" | sudo tee "$SERVICE_FILE"
+

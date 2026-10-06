@@ -97,17 +97,16 @@ go build -o registry-proxy ./cmd/registry-proxy
 
 From the repo root:
 ```sh
-./install.sh   # builds the binary, writes a default ~/registry-proxy/config if missing
-./registry-proxy
+./install.sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now registry-proxy
 ```
 
-Or do it by hand:
+It also redirects ports 80 and 443 to the proxy from the unit itself,
+whether or not `mitm-tls` is on - see
+[Transparent HTTPS](#transparent-https-mitm) for what that's for. As
+root it needs no `setcap` step.
 
-```sh
-go build -o registry-proxy ./cmd/registry-proxy
-mkdir -p ~/registry-proxy && echo "cache-dir = /var/cache/registry-proxy" > ~/registry-proxy/config
-./registry-proxy
-```
 
 ## Using the proxy
 
@@ -192,12 +191,7 @@ that CA will accept certificates it signs for *any* hostname. Only do this
 on machines you control, and only route hosts you trust through it.
 
 Once it's on, redirecting a host to the proxy - with `/etc/hosts` or an
-iptables rule - is enough to make a plain, unmodified request work. No
-`/v2/...`, no `/fetch?url=...`, no per-call changes:
-
-```sh
-wget https://example.com/downloads/file.tar.gz
-```
+iptables rule - is enough to make a plain, unmodified request work.
 
 The proxy terminates the client's TLS with a certificate it signs on the fly
 for whatever `Host` the request names, then fetches and caches `Host` + path
@@ -210,14 +204,10 @@ mitm-tls = true
 ca-dir = ~/registry-proxy/ca
 ```
 
-The proxy never generates this CA itself. It only loads one already present
-in `ca-dir` as `ca-cert.pem` / `ca-key.pem`, and refuses to start if either
-file is missing, naming the one it couldn't find.
-
 ### Generating the CA
 
 [`generate-ca.sh`](generate-ca.sh) creates a root CA and writes it to
-`ca-dir` - `~/registry-proxy/ca` by default, or a path given as the first
+`~/registry-proxy/ca` by default or a path given as the first
 argument:
 
 ```sh
@@ -240,7 +230,7 @@ steps are the same.
 127.0.0.1 ash-speed.hetzner.com
 ```
 
-Every DNS lookup for that name now returns localhost.
+Every DNS lookup for that hostname now returns localhost.
 
 **2. Redirect ports 80 and 443 to the proxy.** One listen port serves both
 protocols: the proxy sniffs the first byte of each connection - `0x16` marks
@@ -253,12 +243,12 @@ sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 80  -j REDIRECT --to-
 sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-port 5000
 ```
 
-`-d 127.0.0.1` scopes each rule to loopback-destined traffic - that is, to
-the hosts you already redirected in step 1. Real outbound HTTPS to other IPs
+`-d 127.0.0.1` scopes each rule to loopback-destined traffic, real outbound HTTPS to other IPs
 is left alone.
 
-**3. Download as usual.** No special flags, no rewritten URL:
+**3. Download as usual using console tools or any other downloaders:
 
+Example:
 ```sh
 curl -O http://ash-speed.hetzner.com/1GB.bin
 wget http://ash-speed.hetzner.com/1GB.bin
@@ -269,15 +259,6 @@ connections, and the result is cached. Delete the local file and run the
 command again - the second run comes from the cache and finishes
 immediately. To compare against a direct download, comment out the
 `/etc/hosts` line and repeat.
-
-The HTTPS form of the same URL works the same way, once `mitm-tls = true`
-and the CA from [Transparent HTTPS](#transparent-https-mitm) is in the
-client's trust store - the proxy has to present a certificate for the host:
-
-```sh
-curl -O https://ash-speed.hetzner.com/1GB.bin
-wget https://ash-speed.hetzner.com/1GB.bin
-```
 
 Traffic arriving this way is cached by URL, not by registry digest. The
 registry-specific behavior - digest-addressed caching, CDN-redirect auth
