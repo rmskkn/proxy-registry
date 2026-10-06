@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,6 +34,20 @@ func hostPort(t *testing.T, srv *httptest.Server) string {
 		t.Fatalf("parsing %q: %v", srv.URL, err)
 	}
 	return u.Host
+}
+
+// requireAria2DockerImage skips the test unless both docker and the aria2
+// image aria2.Start runs are available, since building the image isn't
+// something a plain `go test` run should require.
+func requireAria2DockerImage(t *testing.T) {
+	t.Helper()
+	const dockerImage = "registry-proxy-aria2:local"
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not found in PATH")
+	}
+	if err := exec.Command("docker", "image", "inspect", dockerImage).Run(); err != nil {
+		t.Skipf("%s not built, skipping (see docker/aria2)", dockerImage)
+	}
 }
 
 func newTestProxy(t *testing.T, insecureHosts ...string) (*Proxy, *httptest.Server) {
@@ -250,9 +267,7 @@ func TestProxyBlobSingleflightDedupesConcurrentFetches(t *testing.T) {
 }
 
 func TestProxyBlobAria2Fetch(t *testing.T) {
-	if _, err := exec.LookPath("aria2c"); err != nil {
-		t.Skip("aria2c not found in PATH, skipping aria2-backed fetch test")
-	}
+	requireAria2DockerImage(t)
 
 	// Large enough to be unambiguous, small enough to keep the test fast.
 	content := make([]byte, 2*1024*1024)
@@ -261,14 +276,15 @@ func TestProxyBlobAria2Fetch(t *testing.T) {
 	}
 	up := newBlobUpstream(t, content)
 
-	c, err := cache.New(t.TempDir())
+	cacheDir := t.TempDir()
+	c, err := cache.New(cacheDir)
 	if err != nil {
 		t.Fatalf("cache.New: %v", err)
 	}
 	cfg := &config.Config{
+		CacheDir:           cacheDir,
 		HTTPTimeout:        5 * time.Second,
 		MinAria2Size:       1024, // force the aria2 path
-		Aria2Path:          "aria2c",
 		Aria2RPCPort:       16880,
 		Aria2Connections:   4,
 		Aria2MinSplit:      "1M",
@@ -302,5 +318,126 @@ func TestProxyBlobAria2Fetch(t *testing.T) {
 	}
 	if len(body) != len(content) {
 		t.Errorf("downloaded %d bytes, want %d", len(body), len(content))
+	}
+}
+
+func writeTestNetrc(t *testing.T, host, login, password string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "netrc")
+	content := fmt.Sprintf("machine %s\nlogin %s\npassword %s\n", host, login, password)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestFetchGenericDirectSendsNetrcBasicAuth covers the /fetch?url=... path
+// that doesn't go through aria2 (content under MinAria2Size): it should
+// attach the Authorization header for a host with a netrc-path entry.
+func TestFetchGenericDirectSendsNetrcBasicAuth(t *testing.T) {
+	content := []byte("small enough to skip aria2")
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Write(content)
+	}))
+	defer upstream.Close()
+
+	host := hostPort(t, upstream)
+	netrcPath := writeTestNetrc(t, strings.Split(host, ":")[0], "alice", "s3cret")
+
+	c, err := cache.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		HTTPTimeout:  5 * time.Second,
+		MinAria2Size: 1 << 30,
+		NetrcPath:    netrcPath,
+	}
+	p := New(cfg, c, nil)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/fetch?url=" + url.QueryEscape(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	const want = "Basic YWxpY2U6czNjcmV0"
+	if gotAuth != want {
+		t.Errorf("upstream saw Authorization=%q, want %q", gotAuth, want)
+	}
+}
+
+// TestFetchGenericAria2SendsNetrcBasicAuth is the aria2-backed counterpart
+// of TestFetchGenericDirectSendsNetrcBasicAuth, using Download's "header"
+// RPC option rather than a direct http.Request.
+func TestFetchGenericAria2SendsNetrcBasicAuth(t *testing.T) {
+	requireAria2DockerImage(t)
+
+	content := make([]byte, 2*1024*1024)
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Write(content)
+	}))
+	defer upstream.Close()
+
+	host := hostPort(t, upstream)
+	netrcPath := writeTestNetrc(t, strings.Split(host, ":")[0], "bob", "topsecret")
+
+	cacheDir := t.TempDir()
+	c, err := cache.New(cacheDir)
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		CacheDir:         cacheDir,
+		HTTPTimeout:      5 * time.Second,
+		MinAria2Size:     1024,
+		Aria2RPCPort:     16884,
+		Aria2Connections: 4,
+		Aria2MinSplit:    "1M",
+		NetrcPath:        netrcPath,
+	}
+	a, err := aria2.Start(cfg)
+	if err != nil {
+		t.Fatalf("aria2.Start: %v", err)
+	}
+	t.Cleanup(a.Stop)
+
+	p := New(cfg, c, a)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/fetch?url=" + url.QueryEscape(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(body) != len(content) {
+		t.Errorf("downloaded %d bytes, want %d", len(body), len(content))
+	}
+	const want = "Basic Ym9iOnRvcHNlY3JldA=="
+	if gotAuth != want {
+		t.Errorf("upstream saw Authorization=%q, want %q", gotAuth, want)
 	}
 }

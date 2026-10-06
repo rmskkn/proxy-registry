@@ -10,7 +10,7 @@ import (
 func TestApplyFileSetsFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config")
-	content := "# comment\n\nlisten = :9000\naria2-rpc-port=7000\nhttp-timeout = 5s\ninsecure-registries = a:1,b:2\n"
+	content := "# comment\n\nlisten = :9000\naria2-rpc-port=7000\nhttp-timeout = 5s\ninsecure-registries = a:1,b:2\nnetrc-path = /tmp/my-netrc\nmitm-tls = true\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -30,6 +30,23 @@ func TestApplyFileSetsFields(t *testing.T) {
 	}
 	if want := []string{"a:1", "b:2"}; len(c.InsecureRegistries) != 2 || c.InsecureRegistries[0] != want[0] || c.InsecureRegistries[1] != want[1] {
 		t.Errorf("InsecureRegistries = %v, want %v", c.InsecureRegistries, want)
+	}
+	if !c.MITM {
+		t.Error("MITM = false, want true")
+	}
+	if c.NetrcPath != "/tmp/my-netrc" {
+		t.Errorf("NetrcPath = %q, want /tmp/my-netrc", c.NetrcPath)
+	}
+}
+
+func TestApplyFileBadBoolRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte("mitm-tls = not-a-bool\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyFile(defaults(), path); err == nil {
+		t.Error("expected error for malformed bool value, got nil")
 	}
 }
 

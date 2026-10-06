@@ -31,6 +31,11 @@ served locally.
 - **aria2-accelerated downloads**: blobs at or above `min-aria2-size` go
   through aria2's `--split`/`--max-connection-per-server`. Smaller ones are
   fetched directly, where the parallelism would only add overhead.
+- **DNS-isolated aria2**: aria2c always runs inside a container (see
+  `docker/aria2`), with `/etc/hosts` emptied and `/etc/resolv.conf` pinned
+  to the host's real nameserver, so `mitm-tls` or another tool adding
+  host-side `/etc/hosts` entries can't affect aria2's own upstream
+  resolution.
 - **Content-addressed cache**: blobs are keyed by digest, so a layer shared
   across repos or registries is downloaded once. sha256 blobs are verified
   by aria2's own `--checksum`, and concurrent requests for the same digest
@@ -42,15 +47,15 @@ Manifests and tag listings pass through unmodified and uncached.
 
 ## Requirements
 
-- `aria2c` (package `aria2`)
+- Docker (runs aria2c; `install.sh` builds the image from `docker/aria2`)
 - Go 1.22+ (to build from source)
 
 ```sh
 # Debian/Ubuntu
-sudo apt install aria2 golang-go
+sudo apt install golang-go docker.io
 
 # Arch Linux
-sudo pacman -S aria2 go
+sudo pacman -S go docker
 ```
 
 ## Config file
@@ -62,7 +67,6 @@ falls back to the built-in default.
 ```
 listen = :5000
 cache-dir = /var/cache/registry-proxy
-aria2-path = aria2c
 aria2-rpc-port = 6880
 aria2-connections = 16
 aria2-min-split-size = 5M
@@ -77,8 +81,7 @@ ca-dir = ~/registry-proxy/ca
 |---|---|---|
 | `listen` | `:5000` | Address to listen on |
 | `cache-dir` | `~/registry-proxy/cache` | Blob cache + in-progress downloads |
-| `aria2-path` | `aria2c` | Path to the aria2c binary |
-| `aria2-rpc-port` | `6880` | Local aria2 JSON-RPC port |
+| `aria2-rpc-port` | `6880` | aria2 JSON-RPC port, reachable on the host via `--network host` |
 | `aria2-connections` | `16` | Max connections per server for aria2 |
 | `aria2-min-split-size` | `5M` | aria2 `-k` |
 | `min-aria2-size` | `1048576` | Blobs smaller than this bypass aria2 |

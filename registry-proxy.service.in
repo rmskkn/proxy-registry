@@ -3,11 +3,18 @@ Description=registry-proxy - universal HTTP pull-through proxy
 After=network-online.target
 
 [Service]
+Environment=HOME=__HOME__
+ExecStartPre=-/usr/sbin/iptables -t nat -D OUTPUT -d 127.0.0.1 -p tcp --dport 80  -j REDIRECT --to-port __PORT__
+ExecStartPre=/usr/sbin/iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 80  -j REDIRECT --to-port __PORT__
+ExecStartPre=-/usr/sbin/iptables -t nat -D OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-port __PORT__
+ExecStartPre=/usr/sbin/iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-port __PORT__
 ExecStart=__BIN__
-WorkingDirectory=__WORKDIR__
+ExecStopPost=-/usr/sbin/iptables -t nat -D OUTPUT -d 127.0.0.1 -p tcp --dport 80  -j REDIRECT --to-port __PORT__
+ExecStopPost=-/usr/sbin/iptables -t nat -D OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-port __PORT__
 Restart=on-failure
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=default.target
+

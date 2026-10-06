@@ -4,6 +4,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -26,11 +27,33 @@ type Authenticator struct {
 
 	mu     sync.Mutex
 	tokens map[string]cachedToken
+
+	netrc map[string]credential
 }
 
 // New creates an Authenticator that issues requests via client.
 func New(client *http.Client) *Authenticator {
 	return &Authenticator{Client: client, tokens: make(map[string]cachedToken)}
+}
+
+// LoadNetrc reads netrc-format credentials from path for use by BasicAuth.
+func (a *Authenticator) LoadNetrc(path string) error {
+	creds, err := parseNetrc(path)
+	if err != nil {
+		return err
+	}
+	a.netrc = creds
+	return nil
+}
+
+// BasicAuth returns an HTTP "Authorization" header value for host, from
+// credentials loaded via LoadNetrc, if host has an entry.
+func (a *Authenticator) BasicAuth(host string) (string, bool) {
+	c, ok := a.netrc[host]
+	if !ok {
+		return "", false
+	}
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(c.login+":"+c.password)), true
 }
 
 func (a *Authenticator) cachedToken(key string) (string, bool) {

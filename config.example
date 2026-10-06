@@ -1,6 +1,5 @@
 listen = :5000
 #cache-dir = ~/registry-proxy/cache
-aria2-path = aria2c
 aria2-rpc-port = 6880
 aria2-connections = 16
 aria2-min-split-size = 5M

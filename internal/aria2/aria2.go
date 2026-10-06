@@ -1,6 +1,7 @@
-// Package aria2 drives a local aria2c daemon over its JSON-RPC interface to
-// perform segmented, multi-connection downloads of blobs, which is where the
-// actual pull speedup over a plain HTTP GET comes from.
+// Package aria2 drives an aria2c daemon, running in a container, over its
+// JSON-RPC interface to perform segmented, multi-connection downloads of
+// blobs, which is where the actual pull speedup over a plain HTTP GET comes
+// from.
 package aria2
 
 import (
@@ -9,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -17,16 +20,59 @@ import (
 	"registry-proxy/internal/config"
 )
 
-// Aria2 is a handle to a locally-spawned aria2c daemon.
+// Aria2 is a handle to an aria2c daemon running in a container (see Start).
 type Aria2 struct {
-	rpcURL string
-	http   *http.Client
-	cmd    *exec.Cmd
+	rpcURL        string
+	http          *http.Client
+	cmd           *exec.Cmd
+	containerName string
+	dnsDir        string
 }
 
-// Start launches aria2c in RPC daemon mode and waits for it to become ready.
+// dockerImage is the aria2c image Start runs (see docker/aria2).
+const dockerImage = "registry-proxy-aria2:local"
+
+// Start launches aria2c in RPC daemon mode, inside dockerImage, and waits
+// for it to become ready.
+//
+// aria2c always runs in a container with /etc/hosts emptied and
+// /etc/resolv.conf pinned to the host's real nameserver, so its DNS
+// resolution is isolated from the host's /etc/hosts (e.g. mitm-tls
+// entries). --network host keeps the RPC port reachable on 127.0.0.1 as if
+// aria2c ran locally; bind-mounting cfg.CacheDir's absolute path at the
+// same path keeps the --dir/--out paths passed over RPC valid inside the
+// container too.
 func Start(cfg *config.Config) (*Aria2, error) {
-	args := []string{
+	ns, err := hostDNSServer()
+	if err != nil {
+		return nil, fmt.Errorf("reading host DNS server: %w", err)
+	}
+	dnsDir, err := writeDNSIsolationFiles(ns)
+	if err != nil {
+		return nil, fmt.Errorf("preparing aria2 DNS isolation files: %w", err)
+	}
+	cacheDir, err := filepath.Abs(cfg.CacheDir)
+	if err != nil {
+		os.RemoveAll(dnsDir)
+		return nil, fmt.Errorf("resolving cache dir: %w", err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		os.RemoveAll(dnsDir)
+		return nil, fmt.Errorf("creating cache dir: %w", err)
+	}
+
+	containerName := "registry-proxy-aria2-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	dockerArgs := []string{
+		"run", "--rm",
+		"--name", containerName,
+		"--network", "host",
+		"-v", filepath.Join(dnsDir, "hosts") + ":/etc/hosts:ro",
+		"-v", filepath.Join(dnsDir, "resolv.conf") + ":/etc/resolv.conf:ro",
+		"-v", cacheDir + ":" + cacheDir,
+		"--workdir", cacheDir,
+		dockerImage,
+		"aria2c",
+		"--async-dns=true",
 		"--enable-rpc",
 		"--rpc-listen-port=" + strconv.Itoa(cfg.Aria2RPCPort),
 		"--rpc-listen-all=false",
@@ -36,14 +82,18 @@ func Start(cfg *config.Config) (*Aria2, error) {
 		"--quiet=true",
 		"--continue=true",
 	}
-	cmd := exec.Command(cfg.Aria2Path, args...)
+	cmd := exec.Command("docker", dockerArgs...)
+
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting %s: %w", cfg.Aria2Path, err)
+		os.RemoveAll(dnsDir)
+		return nil, fmt.Errorf("starting aria2c: %w", err)
 	}
 	a := &Aria2{
-		rpcURL: fmt.Sprintf("http://127.0.0.1:%d/jsonrpc", cfg.Aria2RPCPort),
-		http:   &http.Client{Timeout: 10 * time.Second},
-		cmd:    cmd,
+		rpcURL:        fmt.Sprintf("http://127.0.0.1:%d/jsonrpc", cfg.Aria2RPCPort),
+		http:          &http.Client{Timeout: 10 * time.Second},
+		cmd:           cmd,
+		containerName: containerName,
+		dnsDir:        dnsDir,
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	var lastErr error
@@ -55,15 +105,60 @@ func Start(cfg *config.Config) (*Aria2, error) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	cmd.Process.Kill()
+	a.Stop()
 	return nil, fmt.Errorf("aria2c RPC did not become ready: %w", lastErr)
 }
 
-// Stop kills the aria2c subprocess.
+// writeDNSIsolationFiles writes an empty hosts file and a resolv.conf
+// pinned to nameserver into a fresh temp dir, for bind-mounting into the
+// aria2 container.
+func writeDNSIsolationFiles(nameserver string) (string, error) {
+	dir, err := os.MkdirTemp("", "registry-proxy-aria2-dns-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "hosts"), nil, 0o644); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "resolv.conf"), []byte("nameserver "+nameserver+"\n"), 0o644); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
+}
+
+// hostDNSServer returns the first nameserver listed in the host's
+// /etc/resolv.conf.
+func hostDNSServer() (string, error) {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return "", err
+	}
+	return firstNameserver(data)
+}
+
+// firstNameserver returns the first "nameserver" line's address from
+// resolv.conf-format data.
+func firstNameserver(data []byte) (string, error) {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "nameserver" {
+			return fields[1], nil
+		}
+	}
+	return "", fmt.Errorf("no nameserver found")
+}
+
+// Stop stops the container, then kills the local docker-run client process
+// - killing only the client would otherwise leave an orphaned --rm
+// container running (it doesn't relay SIGKILL to the container).
 func (a *Aria2) Stop() {
+	exec.Command("docker", "stop", a.containerName).Run()
 	if a.cmd != nil && a.cmd.Process != nil {
 		a.cmd.Process.Kill()
 	}
+	os.RemoveAll(a.dnsDir)
 }
 
 func (a *Aria2) call(method string, params []interface{}) (json.RawMessage, error) {

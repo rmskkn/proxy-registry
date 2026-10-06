@@ -42,13 +42,29 @@ type Proxy struct {
 // New builds a Proxy backed by cache for blob storage and aria2 for
 // accelerated large-blob downloads.
 func New(cfg *config.Config, c *cache.Cache, a *aria2.Aria2) *Proxy {
+	au := auth.New(&http.Client{Timeout: cfg.HTTPTimeout})
+	if cfg.NetrcPath != "" {
+		if err := au.LoadNetrc(cfg.NetrcPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("loading netrc-path %s: %v", cfg.NetrcPath, err)
+		}
+	}
 	return &Proxy{
 		cfg:       cfg,
 		cache:     c,
 		aria2:     a,
-		auth:      auth.New(&http.Client{Timeout: cfg.HTTPTimeout}),
+		auth:      au,
 		blobGroup: singleflight.NewGroup(),
 	}
+}
+
+// basicAuthFor returns an Authorization header value for rawURL's host, from
+// netrc credentials loaded at startup, if any.
+func (p *Proxy) basicAuthFor(rawURL string) (string, bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", false
+	}
+	return p.auth.BasicAuth(u.Hostname())
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -324,6 +340,9 @@ var ariaStatusRe = regexp.MustCompile(`status=(\d+)`)
 func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onStart func()) error {
 	size := int64(-1)
 	if headReq, err := http.NewRequest(http.MethodHead, rawURL, nil); err == nil {
+		if hdr, ok := p.basicAuthFor(rawURL); ok {
+			headReq.Header.Set("Authorization", hdr)
+		}
 		if resp, err := p.auth.Client.Do(headReq); err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -347,7 +366,14 @@ func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onSta
 }
 
 func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64, onStart func()) error {
-	resp, err := p.auth.Client.Get(rawURL)
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	if hdr, ok := p.basicAuthFor(rawURL); ok {
+		req.Header.Set("Authorization", hdr)
+	}
+	resp, err := p.auth.Client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -372,7 +398,11 @@ func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64, onStart 
 func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey string, onStart func()) error {
 	dir := p.cache.TmpDir()
 	out := p.cache.TmpName(cacheKey)
-	if err := p.aria2.Download(ctx, rawURL, nil, dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", onStart); err != nil {
+	var headers []string
+	if hdr, ok := p.basicAuthFor(rawURL); ok {
+		headers = append(headers, "Authorization: "+hdr)
+	}
+	if err := p.aria2.Download(ctx, rawURL, headers, dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", onStart); err != nil {
 		if m := ariaStatusRe.FindStringSubmatch(err.Error()); m != nil {
 			if code, convErr := strconv.Atoi(m[1]); convErr == nil {
 				return upstreamError(code)

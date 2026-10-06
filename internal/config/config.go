@@ -25,10 +25,15 @@ type Config struct {
 
 	CacheDir string
 
-	Aria2Path        string
 	Aria2RPCPort     int
 	Aria2Connections int
 	Aria2MinSplit    string
+
+	// NetrcPath is a netrc(5)-format file; a host it names gets its
+	// credentials sent as HTTP Basic auth on generic /fetch requests.
+	// Defaults to ~/.netrc; aria2c has no netrc support, so this is parsed
+	// and applied by registry-proxy itself, not passed through to it.
+	NetrcPath string
 
 	MinAria2Size int64 // blobs smaller than this are fetched directly, bypassing aria2
 	HTTPTimeout  time.Duration
@@ -41,18 +46,20 @@ type Config struct {
 
 func defaults() *Config {
 	cacheDir := "./cache"
+	netrcPath := ""
 	if home, err := os.UserHomeDir(); err == nil {
 		cacheDir = filepath.Join(home, "registry-proxy", "cache")
+		netrcPath = filepath.Join(home, ".netrc")
 	}
 	return &Config{
 		Listen:           ":5000",
 		MITM:             false,
 		CADir:            "./ca",
 		CacheDir:         cacheDir,
-		Aria2Path:        "aria2c",
 		Aria2RPCPort:     6880,
 		Aria2Connections: 16,
 		Aria2MinSplit:    "5M",
+		NetrcPath:        netrcPath,
 		MinAria2Size:     1 << 20,
 		HTTPTimeout:      30 * time.Second,
 	}

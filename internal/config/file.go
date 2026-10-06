@@ -31,9 +31,8 @@ func setters(c *Config) map[string]func(string) error {
 			c.MITM = b
 			return nil
 		},
-		"ca-dir":     func(v string) error { c.CADir = v; return nil },
-		"cache-dir":  func(v string) error { c.CacheDir = v; return nil },
-		"aria2-path": func(v string) error { c.Aria2Path = v; return nil },
+		"ca-dir":    func(v string) error { c.CADir = v; return nil },
+		"cache-dir": func(v string) error { c.CacheDir = v; return nil },
 		"aria2-rpc-port": func(v string) error {
 			n, err := strconv.Atoi(v)
 			if err != nil {
@@ -51,6 +50,7 @@ func setters(c *Config) map[string]func(string) error {
 			return nil
 		},
 		"aria2-min-split-size": func(v string) error { c.Aria2MinSplit = v; return nil },
+		"netrc-path":           func(v string) error { c.NetrcPath = v; return nil },
 		"min-aria2-size": func(v string) error {
 			n, err := strconv.ParseInt(v, 10, 64)
 			if err != nil {
