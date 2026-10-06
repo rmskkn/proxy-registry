@@ -1,43 +1,44 @@
 # Registry-proxy
 
-Universal HTTP pull-through proxy for container registries (OCI
-Distribution / Registry HTTP API v2).
-Resolves the real upstream per request, follows registry -> CDN redirects,
-and downloads large blobs with [aria2](https://aria2.github.io/) over
-multiple connections for speed. Single Go binary. Download-only, no push support.
+Universal HTTP pull-through proxy for container registries.
+It resolves the real upstream per request, follows registry -> CDN redirects,
+and pulls large blobs through [aria2](https://aria2.github.io/) over many
+parallel connections. One Go binary. Download-only, no push support.
 
 ## Problem
 
-Pulling images across long distances - say, a server in the UK pulling from a
-CDN in Japan - can be slow even with a fast connection, simply because the
-data has so far to travel on every round trip. A single download can't use
-your full bandwidth over that kind of distance. This proxy splits each large
-layer into chunks and downloads them over many connections at once via
-aria2, multiplying effective speed. Once downloaded, the layer is cached, so
-the next pull - from any host, registry, or repo using that same layer - is
-instant.
+Pulling images from a distant registry is slow even on a fast link. Every
+round trip has to cross the distance, and a single TCP stream can't fill
+your bandwidth over that kind of latency.
+
+## Solution
+
+The proxy splits each large layer into chunks and fetches them in parallel
+through aria2, which multiplies effective throughput. The layer is then
+cached, so the next pull of it - from any host, registry, or repo - is
+served locally.
 
 ## How it works
 
 - **Universal routing**: the repo name's leading path component names the
   upstream registry host, e.g. `proxy.local/nginx` -> `docker.io/library/nginx`,
   `proxy.local/gcr.io/google-containers/pause` -> `gcr.io/google-containers/pause`.
-  Any registry speaking the standard OCI/registry token-auth challenge works
-  without extra configuration.
-- **Redirect-aware blob fetch**: resolves the final CDN URL before
-  downloading (net/http drops the registry's bearer token automatically on
-  cross-host redirects, so it's never leaked to a third party).
-- **aria2-accelerated downloads**: blobs at or above `min-aria2-size` use
-  aria2's `--split`/`--max-connection-per-server`; smaller ones are fetched
-  directly.
-- **Content-addressed cache**: blobs are cached by digest, so a layer shared
-  across repos or registries is only downloaded once. sha256 blobs are
-  verified by aria2's own `--checksum`; concurrent requests for the same
-  digest share one in-flight download.
-- **Generic downloads**: `/fetch?url=...` runs any HTTP/HTTPS URL through
-  the same aria2-accelerated, cached pipeline, keyed by the URL's sha256.
+  Any registry that speaks the standard token-auth challenge works out of
+  the box, with no per-registry configuration.
+- **Redirect-aware blob fetch**: the final CDN URL is resolved before the
+  download starts. net/http drops the registry's bearer token on cross-host
+  redirects, so it never reaches a third party.
+- **aria2-accelerated downloads**: blobs at or above `min-aria2-size` go
+  through aria2's `--split`/`--max-connection-per-server`. Smaller ones are
+  fetched directly, where the parallelism would only add overhead.
+- **Content-addressed cache**: blobs are keyed by digest, so a layer shared
+  across repos or registries is downloaded once. sha256 blobs are verified
+  by aria2's own `--checksum`, and concurrent requests for the same digest
+  share a single in-flight download.
+- **Generic downloads**: `/fetch?url=...` sends any HTTP/HTTPS URL through
+  the same accelerated, cached pipeline, keyed by the URL's sha256.
 
-Manifests and tag listings are passed through unmodified and uncached.
+Manifests and tag listings pass through unmodified and uncached.
 
 ## Requirements
 
@@ -54,9 +55,9 @@ sudo pacman -S aria2 go
 
 ## Config file
 
-All settings come from `~/registry-proxy/config`, one `key = value` per line
-(blank lines and `#` comments ignored). Missing file or keys fall back to
-built-in defaults.
+All settings live in `~/registry-proxy/config`, one `key = value` per line.
+Blank lines and `#` comments are ignored. A missing file, or a missing key,
+falls back to the built-in default.
 
 ```
 listen = :5000
@@ -94,13 +95,13 @@ go build -o registry-proxy ./cmd/registry-proxy
 
 ## Installation
 
-Run the following script from the repo root:
+From the repo root:
 ```sh
 ./install.sh   # builds the binary, writes a default ~/registry-proxy/config if missing
 ./registry-proxy
 ```
 
-Or manually:
+Or do it by hand:
 
 ```sh
 go build -o registry-proxy ./cmd/registry-proxy
@@ -110,58 +111,56 @@ mkdir -p ~/registry-proxy && echo "cache-dir = /var/cache/registry-proxy" > ~/re
 
 ## Using the proxy
 
-Any OCI/registry-API client works by pointing it at `localhost:5000` with
-the upstream host as the repo path's leading component - no client-specific
-setup required beyond that. Raw blobs can also be fetched with plain
-HTTP/HTTPS tools, since this is a universal HTTP pull-through proxy, not
-tied to one client:
+Point any client at `localhost:5000` and put the upstream
+host first in the repo path. That's the whole client-side setup. Because
+this is a universal HTTP pull-through proxy rather than a client-specific
+one, plain HTTP tools can fetch raw blobs just as well:
 
 ```sh
 curl -L http://localhost:5000/v2/nginx/blobs/sha256:<digest> -o layer.tar.gz
 wget https://localhost:5000/v2/gcr.io/google-containers/pause/blobs/sha256:<digest>
 ```
 
-The proxy only understands `/v2/...` registry paths - it's not a transparent
-forward proxy. Each client must be pointed at `localhost:5000` explicitly;
-nothing redirects automatically unless the client itself is configured
-(e.g. a registry-mirror setting) to send requests there.
+On the registry side the proxy understands `/v2/...` paths only; it is not a
+transparent forward proxy. Every client has to be aimed at `localhost:5000`
+explicitly, either on the command line or through its own registry-mirror
+setting. Nothing is intercepted for you.
 
-Adding a registry host to `/etc/hosts` pointing at `127.0.0.1` does **not**,
-by itself, make registry pulls (`docker pull`, `crane pull`, etc.) work:
-registry-API routing is path-based, keyed off the repo path's leading
-component (`ResolveUpstream`), not the request's `Host` header. A request
-that arrives with the real registry's native path (no host prefix) can't be
-resolved that way. Point registry clients at `localhost:5000/<repo>`
-directly instead.
+In particular, pointing a registry host at `127.0.0.1` in `/etc/hosts` does
+**not** make `docker pull`, `crane pull`, and friends work. Registry routing
+is path-based, keyed off the repo path's leading component
+(`ResolveUpstream`), not off the request's `Host` header - a request that
+arrives with the registry's native path and no host prefix has nothing to
+resolve. Use `localhost:5000/<repo>` instead.
 
-Plain `wget`/`curl` against an arbitrary HTTPS host redirected via
-`/etc/hosts` *can* be made to work, including the certificate, with the
-transparent-HTTPS setup below - that's a bigger, security-relevant change
-(installing a locally-trusted CA), so it's opt-in and documented separately.
+Plain `wget`/`curl` against an `/etc/hosts`-redirected HTTPS host *can* be
+made to work, certificate included, via the transparent-HTTPS setup below.
+That one installs a locally-trusted CA, so it stays opt-in and is documented
+on its own.
 
-Setting system-wide `HTTP_PROXY`/`HTTPS_PROXY` env vars to point at the
-proxy does **not** work: the proxy implements no `CONNECT` method, so it
-can't act as a classic forward proxy for arbitrary destinations that way.
+System-wide `HTTP_PROXY`/`HTTPS_PROXY` variables won't do anything either.
+The proxy implements no `CONNECT` method and therefore can't serve as a
+classic forward proxy for arbitrary destinations.
 
 ## Generic HTTP/HTTPS downloads
 
-For any URL, not just registry blobs, use the `/fetch` endpoint - it runs
-the same aria2-accelerated, cached pipeline, keyed by the URL's own sha256
-instead of a content digest:
+The `/fetch` endpoint takes any URL, not just registry blobs, and runs it
+through the same accelerated, cached pipeline - keyed by the URL's own
+sha256 rather than a content digest:
 
 ```sh
 curl -L "http://localhost:5000/fetch?url=https://example.com/downloads/file.tar.gz" -o file.tar.gz
 wget "http://localhost:5000/fetch?url=https://example.com/downloads/file.tar.gz"
 ```
 
-A tool must still be pointed at this URL explicitly (via its own
-proxy/mirror/download-URL setting, same as above) - there is still no
-system-wide interception of plain `wget https://example.com/...` calls.
+A tool still has to be pointed at this URL explicitly, through its own
+proxy/mirror/download-URL setting. A bare `wget https://example.com/...` is
+not intercepted.
 
 ### Docker
 
-To avoid prefixing every image with `localhost:5000/`, point the Docker
-daemon at the proxy as a registry mirror:
+To stop prefixing every image with `localhost:5000/`, register the proxy as
+a Docker registry mirror:
 
 ```sh
 sudo mkdir -p /etc/docker
@@ -180,30 +179,29 @@ Verify the mirror is active:
 docker info --format '{{.RegistryConfig.Mirrors}}'
 ```
 
-`docker pull ...` now goes through the proxy automatically. This only
-covers Docker Hub (`docker.io`) - Docker's mirror mechanism doesn't apply to
-other registries. Pulls from `gcr.io`, `quay.io`, etc. still need the
-explicit `localhost:5000/<registry-host>/...` prefix, since routing is
-path-based.
+`docker pull ...` now goes through the proxy automatically. Note that
+Docker's mirror mechanism covers Docker Hub (`docker.io`) only. Pulls from
+`gcr.io`, `quay.io`, and the rest still need the explicit
+`localhost:5000/<registry-host>/...` prefix, because routing is path-based.
 
 ## Transparent HTTPS (MITM)
 
-**Security-relevant, opt-in.** This installs a self-signed root CA, which
-*you* generate and provide, into a client's trust store. Anything that
-trusts that CA will accept certificates it signs for *any* hostname - only
-do this on machines you control, and only point hosts you trust through it.
+**Security-relevant, opt-in.** This mode requires a self-signed root CA that
+*you* generate and install into a client's trust store. Anything trusting
+that CA will accept certificates it signs for *any* hostname. Only do this
+on machines you control, and only route hosts you trust through it.
 
-With this enabled, redirecting a host to the proxy - via `/etc/hosts` or an
-iptables rule - makes a plain, unmodified request work with no per-call
-changes, no `/v2/...` or `/fetch?url=...` involved:
+Once it's on, redirecting a host to the proxy - with `/etc/hosts` or an
+iptables rule - is enough to make a plain, unmodified request work. No
+`/v2/...`, no `/fetch?url=...`, no per-call changes:
 
 ```sh
 wget https://example.com/downloads/file.tar.gz
 ```
 
-The proxy terminates the client's TLS with a certificate it signs on the
-fly for whatever `Host` the request names, then fetches and caches
-`Host` + path internally the same way `/fetch?url=...` does.
+The proxy terminates the client's TLS with a certificate it signs on the fly
+for whatever `Host` the request names, then fetches and caches `Host` + path
+internally, exactly as `/fetch?url=...` does.
 
 Enable it in the config file:
 
@@ -212,40 +210,53 @@ mitm-tls = true
 ca-dir = ~/registry-proxy/ca
 ```
 
-The proxy does **not** generate this CA itself - it only loads one you
-already placed in `ca-dir` as `ca-cert.pem` / `ca-key.pem`. Start without
-both files present and it fails to start, naming the missing file.
+The proxy never generates this CA itself. It only loads one already present
+in `ca-dir` as `ca-cert.pem` / `ca-key.pem`, and refuses to start if either
+file is missing, naming the one it couldn't find.
 
 ### Generating the CA
 
-Run [`generate-ca.sh`](generate-ca.sh) to generate a root CA and write it to
-`ca-dir` (defaults to `~/registry-proxy/ca`, or pass a path as the first
-argument):
+[`generate-ca.sh`](generate-ca.sh) creates a root CA and writes it to
+`ca-dir` - `~/registry-proxy/ca` by default, or a path given as the first
+argument:
 
 ```sh
 ./generate-ca.sh
 ```
 
-Follow the trust-store install instructions the script prints at the end.
+Then follow the trust-store install instructions it prints at the end.
 
-### Auto HTTP/HTTPS localhost port redirection
-The proxy's single listen port serves both protocols - it sniffs the first
-byte of each connection (`0x16` means a TLS `ClientHello`) and dispatches to
-a plain or TLS-terminating handler accordingly. That's what makes it
-possible to redirect both port 80 and port 443 at the *same* proxy port:
+## Redirecting hosts with /etc/hosts
+
+To send a host's traffic to the local proxy, give it a `127.0.0.1` entry in
+`/etc/hosts`. Use the bare hostname - no scheme, no path:
+
+```
+127.0.0.1 ash-speed.hetzner.com
+```
+
+Every DNS lookup for `ash-speed.hetzner.com` now resolves to localhost. Next,
+set up the port redirection below.
+
+### HTTP/HTTPS port redirection
+
+One listen port serves both protocols. The proxy sniffs the first byte of
+each connection - `0x16` marks a TLS `ClientHello` - and hands it to either
+the plain or the TLS-terminating handler. That's what lets ports 80 and 443
+both redirect to the *same* proxy port:
 
 ```sh
 sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 80  -j REDIRECT --to-port 5000
 sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-port 5000
 ```
 
-(`-d 127.0.0.1` scopes the rule to loopback-destined traffic, i.e. hosts
-you've already redirected via `/etc/hosts` - it won't touch real outbound
-HTTPS traffic to other IPs.)
+`-d 127.0.0.1` scopes each rule to loopback-destined traffic - that is, to
+the hosts you already redirected in `/etc/hosts`. Real outbound HTTPS to
+other IPs is left alone.
 
-Note this caches by URL, not registry digest - registry-specific behavior
-(digest-addressed caching, CDN-redirect auth stripping) doesn't apply to
-registry hosts reached this way.
+Traffic arriving this way is cached by URL, not by registry digest. The
+registry-specific behavior - digest-addressed caching, CDN-redirect auth
+stripping - does not apply to registry hosts reached through it.
 
 ## License
 
@@ -253,5 +264,4 @@ registry hosts reached this way.
 
 ---
 
-Contributions are welcome. If this project is useful to you, consider
-starring the repository.
+Contributions are welcome. If the project is useful to you, a star helps.
