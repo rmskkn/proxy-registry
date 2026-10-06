@@ -226,24 +226,27 @@ argument:
 
 Then follow the trust-store install instructions it prints at the end.
 
-## Redirecting hosts with /etc/hosts
+## How to use
 
-To send a host's traffic to the local proxy, give it a `127.0.0.1` entry in
-`/etc/hosts`. Use the bare hostname - no scheme, no path:
+Everything below uses `ash-speed.hetzner.com` as the example host, because
+Hetzner publishes test files big enough to show the speed difference.
+Substitute whatever host you actually want to route through the proxy - the
+steps are the same.
+
+**1. Resolve the host to localhost.** Add a `127.0.0.1` entry in
+`/etc/hosts`, using the bare hostname - no scheme, no path:
 
 ```
 127.0.0.1 ash-speed.hetzner.com
 ```
 
-Every DNS lookup for `ash-speed.hetzner.com` now resolves to localhost. Next,
-set up the port redirection below.
+Every DNS lookup for that name now returns localhost.
 
-### HTTP/HTTPS port redirection
-
-One listen port serves both protocols. The proxy sniffs the first byte of
-each connection - `0x16` marks a TLS `ClientHello` - and hands it to either
-the plain or the TLS-terminating handler. That's what lets ports 80 and 443
-both redirect to the *same* proxy port:
+**2. Redirect ports 80 and 443 to the proxy.** One listen port serves both
+protocols: the proxy sniffs the first byte of each connection - `0x16` marks
+a TLS `ClientHello` - and hands it to either the plain or the
+TLS-terminating handler. That's what lets both ports point at the *same*
+proxy port:
 
 ```sh
 sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 80  -j REDIRECT --to-port 5000
@@ -251,8 +254,30 @@ sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-
 ```
 
 `-d 127.0.0.1` scopes each rule to loopback-destined traffic - that is, to
-the hosts you already redirected in `/etc/hosts`. Real outbound HTTPS to
-other IPs is left alone.
+the hosts you already redirected in step 1. Real outbound HTTPS to other IPs
+is left alone.
+
+**3. Download as usual.** No special flags, no rewritten URL:
+
+```sh
+curl -O http://ash-speed.hetzner.com/1GB.bin
+wget http://ash-speed.hetzner.com/1GB.bin
+```
+
+The request lands on the proxy, aria2 pulls the file over parallel
+connections, and the result is cached. Delete the local file and run the
+command again - the second run comes from the cache and finishes
+immediately. To compare against a direct download, comment out the
+`/etc/hosts` line and repeat.
+
+The HTTPS form of the same URL works the same way, once `mitm-tls = true`
+and the CA from [Transparent HTTPS](#transparent-https-mitm) is in the
+client's trust store - the proxy has to present a certificate for the host:
+
+```sh
+curl -O https://ash-speed.hetzner.com/1GB.bin
+wget https://ash-speed.hetzner.com/1GB.bin
+```
 
 Traffic arriving this way is cached by URL, not by registry digest. The
 registry-specific behavior - digest-addressed caching, CDN-redirect auth
