@@ -4,6 +4,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +15,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -37,6 +40,12 @@ type Proxy struct {
 	aria2     *aria2.Aria2
 	auth      *auth.Authenticator
 	blobGroup *singleflight.Group
+
+	// genericClient is used only by the generic-fetch pipeline (fetchGeneric,
+	// fetchDirectGeneric): it dials through dialBypassingHosts so a host
+	// locally redirected at this proxy still reaches the real upstream when
+	// the proxy itself is the one making the request. See realdns.go.
+	genericClient *http.Client
 }
 
 // New builds a Proxy backed by cache for blob storage and aria2 for
@@ -54,6 +63,10 @@ func New(cfg *config.Config, c *cache.Cache, a *aria2.Aria2) *Proxy {
 		aria2:     a,
 		auth:      au,
 		blobGroup: singleflight.NewGroup(),
+		genericClient: &http.Client{
+			Timeout:   cfg.HTTPTimeout,
+			Transport: &http.Transport{DialContext: dialBypassingHosts},
+		},
 	}
 }
 
@@ -255,11 +268,13 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 	}
 
 	headerSent := false
+	var discoveredHeaders http.Header
 	if !p.cache.Has(cacheKey) {
 		// Early 200 is gated on onStarted (real progress), not addUri's gid,
 		// so a URL that 404s upstream doesn't get a 200 already sent.
-		onStarted := func(totalLength int64) {
+		onStarted := func(totalLength int64, headers http.Header) {
 			headerSent = true
+			copyForwardableHeaders(w.Header(), headers)
 			if totalLength > 0 {
 				w.Header().Set("Content-Length", strconv.FormatInt(totalLength, 10))
 			}
@@ -272,7 +287,9 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			if p.cache.Has(cacheKey) { // a concurrent caller may have just finished
 				return nil
 			}
-			return p.fetchGeneric(r.Context(), raw, cacheKey, onStarted)
+			headers, err := p.fetchGeneric(r.Context(), raw, cacheKey, onStarted)
+			discoveredHeaders = headers
+			return err
 		})
 		if err != nil {
 			if headerSent {
@@ -304,6 +321,21 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 		return
 	}
 
+	// http.ServeContent only sniffs a Content-Type when none is set yet, and
+	// its sniffer has no notion of JSON - a JSON body comes back as
+	// "text/plain; charset=utf-8", which a strict client (e.g. Conan's API
+	// responses) rejects. discoveredHeaders is only set by a fresh fetch
+	// this request just performed - a pure cache hit (or a follower that
+	// waited out someone else's singleflight.Do) never calls fetchGeneric at
+	// all, so fall back to what the entry's actual fetch persisted.
+	if discoveredHeaders == nil {
+		if data, err := p.cache.ReadMeta(cacheKey); err == nil {
+			discoveredHeaders, _ = decodeHeaders(data)
+		}
+	}
+	if discoveredHeaders != nil {
+		copyForwardableHeaders(w.Header(), discoveredHeaders)
+	}
 	f, fi, err := p.cache.Open(cacheKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -375,23 +407,27 @@ func ariaUpstreamError(err error) error {
 // min-aria2-size and fetching directly below it, mirroring fetchBlob - but
 // with no digest to verify against, since the URL carries no content hash.
 //
-// The preflight HEAD below is only used for the size decision, never to
-// decide success/failure: when rawURL's host has been pointed at this same
-// proxy out-of-band (the MITM use case), the HEAD - sent through the
-// ordinary system resolver, which honors /etc/hosts - loops back into the
-// proxy itself instead of reaching the real upstream, since the target is
-// (correctly) not cached yet. aria2 does its own DNS resolution and isn't
-// subject to that loop, so it's the only thing trusted for pass/fail.
-func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onStarted func(totalLength int64)) error {
+// The preflight HEAD below, and fetchDirectGeneric's own GET, both go out
+// through p.genericClient (dialBypassingHosts, see realdns.go): when
+// rawURL's host has been pointed at this same proxy out-of-band (the MITM
+// use case), the ordinary system resolver would loop the request back into
+// the proxy itself instead of reaching the real upstream, since the target
+// is (correctly) not cached yet. aria2 sidesteps the same problem for its
+// own downloads via its own DNS isolation; genericClient does the
+// equivalent for these two direct requests, so their size and headers are
+// trustworthy instead of reflecting the proxy's own 404.
+func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onStarted func(totalLength int64, headers http.Header)) (http.Header, error) {
 	size := int64(-1)
+	var headers http.Header
 	if headReq, err := http.NewRequest(http.MethodHead, rawURL, nil); err == nil {
 		if hdr, ok := p.basicAuthFor(rawURL); ok {
 			headReq.Header.Set("Authorization", hdr)
 		}
-		if resp, err := p.auth.Client.Do(headReq); err == nil {
+		if resp, err := p.genericClient.Do(headReq); err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				size = resp.ContentLength
+				headers = resp.Header
 			}
 		}
 	}
@@ -402,12 +438,75 @@ func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onSta
 	if size >= 0 && size < p.cfg.MinAria2Size {
 		err = p.fetchDirectGeneric(rawURL, cacheKey, size)
 	} else {
-		err = p.fetchWithAria2Generic(ctx, rawURL, cacheKey, onStarted)
+		err = p.fetchWithAria2Generic(ctx, rawURL, cacheKey, headers, onStarted)
 	}
 	if err == nil {
 		done()
+		if headers != nil {
+			if werr := p.cache.WriteMeta(cacheKey, encodeHeaders(headers)); werr != nil {
+				log.Printf("writing header metadata for %s: %v", rawURL, werr)
+			}
+		}
 	}
-	return err
+	return headers, err
+}
+
+// hopByHopHeaders names headers that are connection-scoped (RFC 7230 §6.1)
+// or that fetchURL/http.ServeContent already derive themselves from the
+// actual transfer - these must never be copied verbatim from an upstream
+// HEAD onto the response for a different connection and body.
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+	"Content-Length":      true,
+	"Date":                true,
+}
+
+// copyForwardableHeaders sets every header from src onto dst except the
+// ones in hopByHopHeaders.
+func copyForwardableHeaders(dst http.Header, src http.Header) {
+	for k, v := range src {
+		if hopByHopHeaders[k] {
+			continue
+		}
+		dst[k] = v
+	}
+}
+
+// encodeHeaders serializes h as a MIME-style header block, for persisting
+// alongside a cached generic-fetch entry (see cache.WriteMeta) - a second
+// request for the same URL that lands on a pure cache hit never calls
+// fetchGeneric again, so without this it would fall back to
+// http.ServeContent's sniffing every time, the exact mismatch
+// (JSON sniffed as text/plain) this header-forwarding fix exists for.
+func encodeHeaders(h http.Header) []byte {
+	var buf bytes.Buffer
+	for k, vs := range h {
+		for _, v := range vs {
+			buf.WriteString(k)
+			buf.WriteString(": ")
+			buf.WriteString(v)
+			buf.WriteString("\r\n")
+		}
+	}
+	buf.WriteString("\r\n")
+	return buf.Bytes()
+}
+
+// decodeHeaders parses what encodeHeaders wrote.
+func decodeHeaders(data []byte) (http.Header, error) {
+	tp := textproto.NewReader(bufio.NewReader(bytes.NewReader(data)))
+	mh, err := tp.ReadMIMEHeader()
+	if err != nil {
+		return nil, err
+	}
+	return http.Header(mh), nil
 }
 
 func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64) error {
@@ -418,7 +517,7 @@ func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64) error {
 	if hdr, ok := p.basicAuthFor(rawURL); ok {
 		req.Header.Set("Authorization", hdr)
 	}
-	resp, err := p.auth.Client.Do(req)
+	resp, err := p.genericClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -437,10 +536,15 @@ func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64) error {
 	return p.cache.Write(cacheKey, data)
 }
 
-func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey string, onStarted func(totalLength int64)) error {
+func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey string, headers http.Header, onStarted func(totalLength int64, headers http.Header)) error {
 	dir := p.cache.TmpDir()
 	out := p.cache.TmpName(cacheKey)
-	if err := p.aria2.Download(ctx, rawURL, nil, p.basicCredsFor(rawURL), dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", onStarted); err != nil {
+	wrapped := func(totalLength int64) {
+		if onStarted != nil {
+			onStarted(totalLength, headers)
+		}
+	}
+	if err := p.aria2.Download(ctx, rawURL, nil, p.basicCredsFor(rawURL), dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", wrapped); err != nil {
 		return ariaUpstreamError(err)
 	}
 	return p.cache.Commit(cacheKey, filepath.Join(dir, out))

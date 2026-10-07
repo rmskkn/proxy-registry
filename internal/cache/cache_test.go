@@ -60,6 +60,33 @@ func TestCacheWriteHasOpenStat(t *testing.T) {
 	}
 }
 
+func TestCacheWriteMetaReadMeta(t *testing.T) {
+	c, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	digest := "sha256:" + hex64('b')
+	if err := c.Write(digest, []byte("body")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if _, err := c.ReadMeta(digest); err == nil {
+		t.Fatal("ReadMeta succeeded before any WriteMeta")
+	}
+
+	want := []byte("Content-Type: application/json\r\n")
+	if err := c.WriteMeta(digest, want); err != nil {
+		t.Fatalf("WriteMeta: %v", err)
+	}
+	got, err := c.ReadMeta(digest)
+	if err != nil {
+		t.Fatalf("ReadMeta: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("ReadMeta = %q, want %q", got, want)
+	}
+}
+
 func TestCacheCommit(t *testing.T) {
 	c, err := New(t.TempDir())
 	if err != nil {

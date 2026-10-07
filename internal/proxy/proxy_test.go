@@ -378,6 +378,127 @@ func TestFetchGenericDirectSendsNetrcBasicAuth(t *testing.T) {
 	}
 }
 
+// TestFetchGenericDirectForwardsHeadersExceptHopByHop: the preflight HEAD's
+// response headers should reach the client (e.g. ETag, Cache-Control - a
+// strict client may validate on these, not just Content-Type), but
+// connection-scoped headers must not be copied onto a different connection.
+func TestFetchGenericDirectForwardsHeadersExceptHopByHop(t *testing.T) {
+	content := []byte(`{"ok":true}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"abc123"`)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Write(content)
+	}))
+	defer upstream.Close()
+
+	c, err := cache.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		HTTPTimeout:  5 * time.Second,
+		MinAria2Size: 1 << 30,
+	}
+	p := New(cfg, c, nil)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/fetch?url=" + url.QueryEscape(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != string(content) {
+		t.Errorf("body = %q, want %q", body, content)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if got := resp.Header.Get("ETag"); got != `"abc123"` {
+		t.Errorf("ETag = %q, want \"abc123\"", got)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != fmt.Sprintf("%d", len(content)) {
+		t.Errorf("Content-Length = %q, want %d (the actual served body, not the HEAD's)", got, len(content))
+	}
+	if got := resp.Header.Get("Connection"); got != "" {
+		t.Errorf("Connection = %q, want unset - hop-by-hop headers must not be forwarded", got)
+	}
+}
+
+// TestFetchGenericCacheHitStillGetsRealContentType: a second request for a
+// URL already cached from a prior fetch must still get the real
+// Content-Type, not http.ServeContent's sniffing - a pure cache hit never
+// calls fetchGeneric again, so without persisting the first fetch's headers
+// (cache.WriteMeta/ReadMeta) every repeat request for a JSON body would
+// come back as "text/plain; charset=utf-8" (Go's sniffer has no JSON
+// signature), exactly the mismatch that broke Conan against the real
+// Artifactory API in production.
+func TestFetchGenericCacheHitStillGetsRealContentType(t *testing.T) {
+	content := []byte(`{"ok":true}`)
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			upstreamHits++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Write(content)
+	}))
+	defer upstream.Close()
+
+	c, err := cache.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		HTTPTimeout:  5 * time.Second,
+		MinAria2Size: 1 << 30,
+	}
+	p := New(cfg, c, nil)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	fetchURL := srv.URL + "/fetch?url=" + url.QueryEscape(upstream.URL)
+	for i := 0; i < 2; i++ {
+		resp, err := http.Get(fetchURL)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i, resp.StatusCode)
+		}
+		if string(body) != string(content) {
+			t.Errorf("request %d: body = %q, want %q", i, body, content)
+		}
+		if got := resp.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("request %d: Content-Type = %q, want application/json", i, got)
+		}
+	}
+	if upstreamHits != 1 {
+		t.Errorf("upstream GET hits = %d, want 1 (second request should be a pure cache hit)", upstreamHits)
+	}
+}
+
 // TestFetchGenericAria2SendsNetrcBasicAuth: aria2-backed counterpart of
 // TestFetchGenericDirectSendsNetrcBasicAuth; upstream must 401 first since
 // http-user/http-passwd is challenge-based.
@@ -447,6 +568,80 @@ func TestFetchGenericAria2SendsNetrcBasicAuth(t *testing.T) {
 	const want = "Basic Ym9iOnRvcHNlY3JldA=="
 	if gotAuth != want {
 		t.Errorf("upstream saw Authorization=%q, want %q", gotAuth, want)
+	}
+}
+
+// TestFetchGenericAria2PreservesContentType: the early-200 path (fired from
+// aria2's onStarted, see fetchURL) must still carry the upstream's
+// Content-Type, picked up from the preflight HEAD in fetchGeneric - a client
+// parsing the body (e.g. a pypi simple-index page) needs it to know what it
+// got. The body is written in slow chunks so the download stays "active"
+// for multiple aria2 poll ticks and onStarted actually fires, instead of
+// completing within a single tick (see the "no onStarted" caveat in
+// fetchURL's doc comment).
+func TestFetchGenericAria2PreservesContentType(t *testing.T) {
+	requireAria2DockerImage(t)
+
+	content := make([]byte, 2*1024*1024)
+	const wantType = "application/vnd.pypi.simple.v1+json"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", wantType)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		const chunk = 256 * 1024
+		for i := 0; i < len(content); i += chunk {
+			end := i + chunk
+			if end > len(content) {
+				end = len(content)
+			}
+			w.Write(content[i:end])
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	cacheDir := t.TempDir()
+	c, err := cache.New(cacheDir)
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		CacheDir:         cacheDir,
+		HTTPTimeout:      5 * time.Second,
+		MinAria2Size:     1024,
+		Aria2RPCPort:     16886,
+		Aria2Connections: 4,
+		Aria2MinSplit:    "1M",
+	}
+	a, err := aria2.Start(cfg)
+	if err != nil {
+		t.Fatalf("aria2.Start: %v", err)
+	}
+	t.Cleanup(a.Stop)
+
+	p := New(cfg, c, a)
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/fetch?url=" + url.QueryEscape(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != wantType {
+		t.Errorf("Content-Type = %q, want %q", got, wantType)
 	}
 }
 

@@ -43,7 +43,7 @@ const dockerImage = "registry-proxy-aria2:local"
 // same path keeps the --dir/--out paths passed over RPC valid inside the
 // container too.
 func Start(cfg *config.Config) (*Aria2, error) {
-	ns, err := hostDNSServer()
+	ns, err := HostDNSServer()
 	if err != nil {
 		return nil, fmt.Errorf("reading host DNS server: %w", err)
 	}
@@ -130,9 +130,9 @@ func writeDNSIsolationFiles(nameserver string) (string, error) {
 	return dir, nil
 }
 
-// hostDNSServer returns the first nameserver listed in the host's
+// HostDNSServer returns the first nameserver listed in the host's
 // /etc/resolv.conf.
-func hostDNSServer() (string, error) {
+func HostDNSServer() (string, error) {
 	data, err := os.ReadFile("/etc/resolv.conf")
 	if err != nil {
 		return "", err

@@ -130,3 +130,35 @@ func (c *Cache) Write(digest string, data []byte) error {
 	}
 	return os.Rename(tmp, p)
 }
+
+// metaPath is the sidecar path for a key's extra metadata (e.g. the
+// upstream response headers learned when the entry was fetched).
+func (c *Cache) metaPath(key string) (string, error) {
+	p, err := c.path(key)
+	if err != nil {
+		return "", err
+	}
+	return p + ".meta", nil
+}
+
+// WriteMeta stores opaque metadata alongside an already-cached key. The
+// caller decides the encoding - cache only persists bytes. Best-effort by
+// design: a caller that fails to read it back later should fall back to
+// its own default, not treat a missing sidecar as corruption.
+func (c *Cache) WriteMeta(key string, data []byte) error {
+	p, err := c.metaPath(key)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, data, 0o644)
+}
+
+// ReadMeta reads back metadata written by WriteMeta for key, or returns an
+// error (including a plain "not exist") if none was ever written.
+func (c *Cache) ReadMeta(key string) ([]byte, error) {
+	p, err := c.metaPath(key)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(p)
+}

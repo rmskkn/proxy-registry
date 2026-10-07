@@ -31,3 +31,6 @@ echo ""
 echo "  # Arch Linux"
 echo "  sudo cp $CA_DIR/ca-cert.pem /etc/ca-certificates/trust-source/anchors/registry-proxy.crt"
 echo "  sudo trust extract-compat"
+
+# For url3 pythyon lib clients
+cat ~/registry-proxy/ca/ca-cert.pem "$(python3 -c "import certifi; print(certifi.where())")" > ~/registry-proxy/ca/combined-ca-bundle.pem
