@@ -67,6 +67,21 @@ func (p *Proxy) basicAuthFor(rawURL string) (string, bool) {
 	return p.auth.BasicAuth(u.Hostname())
 }
 
+// basicCredsFor returns netrc credentials for rawURL's host unencoded, for
+// the aria2 path - see aria2.BasicCreds for why that path can't use the
+// header basicAuthFor builds.
+func (p *Proxy) basicCredsFor(rawURL string) *aria2.BasicCreds {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	login, password, ok := p.auth.BasicCreds(u.Hostname())
+	if !ok {
+		return nil
+	}
+	return &aria2.BasicCreds{User: login, Password: password}
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/fetch" {
 		p.handleFetch(w, r)
@@ -79,6 +94,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !strings.HasPrefix(r.URL.Path, "/v2/") {
+		if p.cfg.MITM {
+			// Plain HTTP side of a transparently redirected host (e.g. port 80
+			// iptables-REDIRECTed here alongside 443): same pipeline as
+			// ServeMITM's TLS side, just without a cert to terminate.
+			p.fetchURL(w, r, "http://"+r.Host+r.URL.RequestURI())
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
@@ -232,16 +254,15 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 		return
 	}
 
+	headerSent := false
 	if !p.cache.Has(cacheKey) {
-		// Send 200 as soon as the download has actually started, rather than
-		// upfront: the client then waits on the body (no premature status) but
-		// stops seeing a stalled "awaiting response" with no sign of progress.
-		// If fetchGeneric fails after this point the status is already
-		// committed, so the only signal left for a failure is closing the
-		// connection without a body.
-		headerSent := false
-		started := func() {
+		// Early 200 is gated on onStarted (real progress), not addUri's gid,
+		// so a URL that 404s upstream doesn't get a 200 already sent.
+		onStarted := func(totalLength int64) {
 			headerSent = true
+			if totalLength > 0 {
+				w.Header().Set("Content-Length", strconv.FormatInt(totalLength, 10))
+			}
 			w.WriteHeader(http.StatusOK)
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
@@ -251,15 +272,18 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			if p.cache.Has(cacheKey) { // a concurrent caller may have just finished
 				return nil
 			}
-			return p.fetchGeneric(r.Context(), raw, cacheKey, started)
+			return p.fetchGeneric(r.Context(), raw, cacheKey, onStarted)
 		})
 		if err != nil {
 			if headerSent {
-				log.Printf("fetch failed for %s after headers sent: %v", raw, err)
+				// The status is already committed to the wire; nothing left
+				// to do but close the connection without a body.
+				log.Printf("fetch failed for %s after headers were already sent: %v", raw, err)
 				return
 			}
 			var use *upstreamStatusError
 			if errors.As(err, &use) {
+				log.Printf("fetch failed for %s: %v", raw, err)
 				http.Error(w, use.text, use.status)
 				return
 			}
@@ -267,15 +291,19 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			http.Error(w, "failed to fetch url", http.StatusBadGateway)
 			return
 		}
+	}
+
+	if headerSent {
 		f, _, err := p.cache.Open(cacheKey)
 		if err != nil {
-			log.Printf("open cache after fetch for %s: %v", raw, err)
+			log.Printf("opening cache entry for %s after headers were already sent: %v", raw, err)
 			return
 		}
 		defer f.Close()
 		io.Copy(w, f)
 		return
 	}
+
 	f, fi, err := p.cache.Open(cacheKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -322,6 +350,27 @@ func upstreamError(status int) error {
 // (e.g. "The response status is not successful. status=404").
 var ariaStatusRe = regexp.MustCompile(`status=(\d+)`)
 
+// ariaUpstreamError maps an aria2 download failure to the client-facing
+// HTTP status; unmapped codes stay as-is and surface as a 502.
+func ariaUpstreamError(err error) error {
+	var de *aria2.DownloadError
+	if !errors.As(err, &de) {
+		return err
+	}
+	if m := ariaStatusRe.FindStringSubmatch(de.Message); m != nil {
+		if code, convErr := strconv.Atoi(m[1]); convErr == nil && code >= 400 && code <= 599 {
+			return fmt.Errorf("%w: %v", upstreamError(code), de)
+		}
+	}
+	switch de.Code {
+	case 3: // resource not found
+		return fmt.Errorf("%w: %v", upstreamError(http.StatusNotFound), de)
+	case 24: // HTTP authorization failed
+		return fmt.Errorf("%w: %v", upstreamError(http.StatusUnauthorized), de)
+	}
+	return err
+}
+
 // fetchGeneric downloads an arbitrary URL, routing through aria2 above
 // min-aria2-size and fetching directly below it, mirroring fetchBlob - but
 // with no digest to verify against, since the URL carries no content hash.
@@ -333,11 +382,7 @@ var ariaStatusRe = regexp.MustCompile(`status=(\d+)`)
 // proxy itself instead of reaching the real upstream, since the target is
 // (correctly) not cached yet. aria2 does its own DNS resolution and isn't
 // subject to that loop, so it's the only thing trusted for pass/fail.
-// onStart, if non-nil, is invoked once the download has actually begun
-// (upstream confirmed OK for the direct path, aria2 accepted the task for
-// the aria2 path) - never on a failure - so a caller can commit to sending
-// response headers at that point instead of guessing upfront.
-func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onStart func()) error {
+func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onStarted func(totalLength int64)) error {
 	size := int64(-1)
 	if headReq, err := http.NewRequest(http.MethodHead, rawURL, nil); err == nil {
 		if hdr, ok := p.basicAuthFor(rawURL); ok {
@@ -355,9 +400,9 @@ func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onSta
 
 	var err error
 	if size >= 0 && size < p.cfg.MinAria2Size {
-		err = p.fetchDirectGeneric(rawURL, cacheKey, size, onStart)
+		err = p.fetchDirectGeneric(rawURL, cacheKey, size)
 	} else {
-		err = p.fetchWithAria2Generic(ctx, rawURL, cacheKey, onStart)
+		err = p.fetchWithAria2Generic(ctx, rawURL, cacheKey, onStarted)
 	}
 	if err == nil {
 		done()
@@ -365,7 +410,7 @@ func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onSta
 	return err
 }
 
-func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64, onStart func()) error {
+func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64) error {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
@@ -381,9 +426,6 @@ func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64, onStart 
 	if resp.StatusCode != http.StatusOK {
 		return upstreamError(resp.StatusCode)
 	}
-	if onStart != nil {
-		onStart()
-	}
 	limited := io.LimitReader(resp.Body, size+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
@@ -395,20 +437,11 @@ func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64, onStart 
 	return p.cache.Write(cacheKey, data)
 }
 
-func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey string, onStart func()) error {
+func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey string, onStarted func(totalLength int64)) error {
 	dir := p.cache.TmpDir()
 	out := p.cache.TmpName(cacheKey)
-	var headers []string
-	if hdr, ok := p.basicAuthFor(rawURL); ok {
-		headers = append(headers, "Authorization: "+hdr)
-	}
-	if err := p.aria2.Download(ctx, rawURL, headers, dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", onStart); err != nil {
-		if m := ariaStatusRe.FindStringSubmatch(err.Error()); m != nil {
-			if code, convErr := strconv.Atoi(m[1]); convErr == nil {
-				return upstreamError(code)
-			}
-		}
-		return err
+	if err := p.aria2.Download(ctx, rawURL, nil, p.basicCredsFor(rawURL), dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", onStarted); err != nil {
+		return ariaUpstreamError(err)
 	}
 	return p.cache.Commit(cacheKey, filepath.Join(dir, out))
 }
@@ -497,7 +530,11 @@ func (p *Proxy) fetchWithAria2(ctx context.Context, finalURL, auth, alg, hexDige
 	if alg == "sha256" {
 		checksum = hexDigest
 	}
-	if err := p.aria2.Download(ctx, finalURL, headers, dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, checksum, nil); err != nil {
+	// No BasicCreds here: net/http already followed the registry -> CDN
+	// redirect in fetchBlob and stripped Authorization if that crossed
+	// hosts, so headers holds a bearer token that is valid for finalURL's
+	// host specifically.
+	if err := p.aria2.Download(ctx, finalURL, headers, nil, dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, checksum, nil); err != nil {
 		return err
 	}
 	downloaded := filepath.Join(dir, out)

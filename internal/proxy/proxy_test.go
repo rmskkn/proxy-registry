@@ -378,16 +378,24 @@ func TestFetchGenericDirectSendsNetrcBasicAuth(t *testing.T) {
 	}
 }
 
-// TestFetchGenericAria2SendsNetrcBasicAuth is the aria2-backed counterpart
-// of TestFetchGenericDirectSendsNetrcBasicAuth, using Download's "header"
-// RPC option rather than a direct http.Request.
+// TestFetchGenericAria2SendsNetrcBasicAuth: aria2-backed counterpart of
+// TestFetchGenericDirectSendsNetrcBasicAuth; upstream must 401 first since
+// http-user/http-passwd is challenge-based.
 func TestFetchGenericAria2SendsNetrcBasicAuth(t *testing.T) {
 	requireAria2DockerImage(t)
 
 	content := make([]byte, 2*1024*1024)
 	var gotAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodGet {
+			gotAuth = auth
+		}
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
@@ -439,5 +447,128 @@ func TestFetchGenericAria2SendsNetrcBasicAuth(t *testing.T) {
 	const want = "Basic Ym9iOnRvcHNlY3JldA=="
 	if gotAuth != want {
 		t.Errorf("upstream saw Authorization=%q, want %q", gotAuth, want)
+	}
+}
+
+// TestFetchURL404FromUpstreamReturns404: a real 404 must surface as 404, not
+// an early 200 fired before aria2.Download's onStarted gate fires.
+func TestFetchURL404FromUpstreamReturns404(t *testing.T) {
+	requireAria2DockerImage(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cacheDir := t.TempDir()
+	c, err := cache.New(cacheDir)
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		CacheDir:         cacheDir,
+		HTTPTimeout:      5 * time.Second,
+		MinAria2Size:     1 << 30,
+		Aria2RPCPort:     16885,
+		Aria2Connections: 4,
+		Aria2MinSplit:    "1M",
+	}
+	a, err := aria2.Start(cfg)
+	if err != nil {
+		t.Fatalf("aria2.Start: %v", err)
+	}
+	t.Cleanup(a.Stop)
+
+	p := New(cfg, c, a)
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/fetch?url=" + url.QueryEscape(upstream.URL+"/missing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestFetchGenericAria2AuthNotSentToRedirectTarget: Artifactory -> S3 shape;
+// aria2 must not re-send Authorization to a redirect target that 400s on it
+// (errorCode=22); see aria2.BasicCreds.
+func TestFetchGenericAria2AuthNotSentToRedirectTarget(t *testing.T) {
+	requireAria2DockerImage(t)
+
+	content := make([]byte, 2*1024*1024)
+	var redirectTargetSawAuth bool
+	// storage stands in for S3; only aria2's GET is judged (both servers
+	// share a hostname here, unlike production, so the HEAD preflight
+	// isn't representative - its result only ever drives size, not auth).
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get("Authorization") != "" {
+			redirectTargetSawAuth = true
+			http.Error(w, "InvalidArgument: Only one auth mechanism allowed", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Write(content)
+	}))
+	defer storage.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		http.Redirect(w, r, storage.URL+"/blob?X-Amz-Signature=deadbeef", http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	host := hostPort(t, upstream)
+	netrcPath := writeTestNetrc(t, strings.Split(host, ":")[0], "bob", "topsecret")
+
+	cacheDir := t.TempDir()
+	c, err := cache.New(cacheDir)
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	cfg := &config.Config{
+		CacheDir:         cacheDir,
+		HTTPTimeout:      5 * time.Second,
+		MinAria2Size:     1024,
+		Aria2RPCPort:     16886,
+		Aria2Connections: 4,
+		Aria2MinSplit:    "1M",
+		NetrcPath:        netrcPath,
+	}
+	a, err := aria2.Start(cfg)
+	if err != nil {
+		t.Fatalf("aria2.Start: %v", err)
+	}
+	t.Cleanup(a.Stop)
+
+	p := New(cfg, c, a)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/fetch?url=" + url.QueryEscape(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(body) != len(content) {
+		t.Errorf("downloaded %d bytes, want %d", len(body), len(content))
+	}
+	if redirectTargetSawAuth {
+		t.Error("redirect target's GET carried an Authorization header; aria2 must not re-send it to a redirect target")
 	}
 }

@@ -1,41 +1,29 @@
-# Registry-proxy
+# Registry-proxy - Universal HTTP/HTTPS download cache/proxy speed multiplier
 
-Universal HTTP pull-through proxy for container registries.
-It resolves the real upstream per request, follows registry -> CDN redirects,
-and pulls large blobs through [aria2](https://aria2.github.io/) over many
-parallel connections. One Go binary. Download-only, no push support.
 
 ## Problem
 
 Pulling images from a distant registry is slow even on a fast link. Every
-round trip has to cross the distance, and a single TCP stream can't fill
+round trip has to cross the distance and a single TCP stream can't fill
 your bandwidth over that kind of latency.
 
 ## Solution
 
-The proxy splits each large layer into chunks and fetches them in parallel
-through aria2, which multiplies effective throughput. The layer is then
-cached, so the next pull of it - from any host, registry, or repo - is
-served locally.
+Tool splits each large layer of requested binary into chunks and fetches them in
+parallel through [aria2](https://aria2.github.io/) which multiplies
+effective throughput.
 
-## How it works
+## Key features
 
-- **Universal routing**: the repo name's leading path component names the
-  upstream registry host, e.g. `proxy.local/nginx` -> `docker.io/library/nginx`,
-  `proxy.local/gcr.io/google-containers/pause` -> `gcr.io/google-containers/pause`.
-  Any registry that speaks the standard token-auth challenge works out of
-  the box, with no per-registry configuration.
 - **Redirect-aware blob fetch**: the final CDN URL is resolved before the
   download starts. net/http drops the registry's bearer token on cross-host
   redirects, so it never reaches a third party.
 - **aria2-accelerated downloads**: blobs at or above `min-aria2-size` go
   through aria2's `--split`/`--max-connection-per-server`. Smaller ones are
   fetched directly, where the parallelism would only add overhead.
-- **DNS-isolated aria2**: aria2c always runs inside a container (see
+- **DNS-isolated aria2 RPC server**: aria2c always runs inside a container (see
   `docker/aria2`), with `/etc/hosts` emptied and `/etc/resolv.conf` pinned
-  to the host's real nameserver, so `mitm-tls` or another tool adding
-  host-side `/etc/hosts` entries can't affect aria2's own upstream
-  resolution.
+  to the host's real nameserver providing isolation.
 - **Content-addressed cache**: blobs are keyed by digest, so a layer shared
   across repos or registries is downloaded once. sha256 blobs are verified
   by aria2's own `--checksum`, and concurrent requests for the same digest
@@ -226,11 +214,10 @@ Hetzner publishes test files big enough to show the speed difference.
 Substitute whatever host you actually want to route through the proxy - the
 steps are the same.
 
-**1. Resolve the host to localhost.** Add a `127.0.0.1` entry in
-`/etc/hosts`, using the bare hostname - no scheme, no path:
+**1. Add a `127.0.0.1` entry in `/etc/hosts`:
 
-```
-127.0.0.1 ash-speed.hetzner.com
+```sh
+127.0.0.1 tyo.download.datapacket.com
 ```
 
 Every DNS lookup for that hostname now returns localhost.
@@ -249,23 +236,28 @@ sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-
 `-d 127.0.0.1` scopes each rule to loopback-destined traffic, real outbound HTTPS to other IPs
 is left alone.
 
-**3. Download as usual using console tools or any other downloaders:
 
-Example:
+## Benchmarks
+
+** Without registry-proxy: **
 ```sh
-curl -O http://ash-speed.hetzner.com/1GB.bin
-wget http://ash-speed.hetzner.com/1GB.bin
+time  wget https://tyo.download.datapacket.com/1000mb.bin
+real	4m19.443s
+user	0m0.109s
+sys	0m0.259s
 ```
 
-The request lands on the proxy, aria2 pulls the file over parallel
-connections, and the result is cached. Delete the local file and run the
-command again - the second run comes from the cache and finishes
-immediately. To compare against a direct download, comment out the
-`/etc/hosts` line and repeat.
+** Using registry-proxy: **
+```sh
+time  wget https://tyo.download.datapacket.com/1000mb.bin
+real	2m42.123s
+user	0m0.173s
+sys	0m0.499s
+```
 
-Traffic arriving this way is cached by URL, not by registry digest. The
-registry-specific behavior - digest-addressed caching, CDN-redirect auth
-stripping - does not apply to registry hosts reached through it.
+## Caveats:
+1. Some servers don't allow multiple simultaneous connections and chunking.
+Check it before using this tool, try to tune `retry_time` for `aria2c`.
 
 ## License
 

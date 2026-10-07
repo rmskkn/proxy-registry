@@ -49,11 +49,23 @@ func (a *Authenticator) LoadNetrc(path string) error {
 // BasicAuth returns an HTTP "Authorization" header value for host, from
 // credentials loaded via LoadNetrc, if host has an entry.
 func (a *Authenticator) BasicAuth(host string) (string, bool) {
-	c, ok := a.netrc[host]
+	login, password, ok := a.BasicCreds(host)
 	if !ok {
 		return "", false
 	}
-	return "Basic " + base64.StdEncoding.EncodeToString([]byte(c.login+":"+c.password)), true
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(login+":"+password)), true
+}
+
+// BasicCreds returns the login and password loaded for host via LoadNetrc,
+// if host has an entry. Callers that hand credentials to something which
+// does its own HTTP - aria2, via its http-user/http-passwd options - need
+// them unencoded, rather than the pre-built header BasicAuth returns.
+func (a *Authenticator) BasicCreds(host string) (login, password string, ok bool) {
+	c, ok := a.netrc[host]
+	if !ok {
+		return "", "", false
+	}
+	return c.login, c.password, true
 }
 
 func (a *Authenticator) cachedToken(key string) (string, bool) {

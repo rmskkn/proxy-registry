@@ -65,6 +65,9 @@ func Start(cfg *config.Config) (*Aria2, error) {
 	dockerArgs := []string{
 		"run", "--rm",
 		"--name", containerName,
+		// Image has no USER; without this, files land root-owned on the
+		// host, undeletable by the proxy's own user.
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--network", "host",
 		"-v", filepath.Join(dnsDir, "hosts") + ":/etc/hosts:ro",
 		"-v", filepath.Join(dnsDir, "resolv.conf") + ":/etc/resolv.conf:ro",
@@ -79,7 +82,6 @@ func Start(cfg *config.Config) (*Aria2, error) {
 		"--allow-overwrite=true",
 		"--auto-file-renaming=false",
 		"--file-allocation=none",
-		"--quiet=true",
 		"--continue=true",
 	}
 	cmd := exec.Command("docker", dockerArgs...)
@@ -189,21 +191,55 @@ func (a *Aria2) call(method string, params []interface{}) (json.RawMessage, erro
 	return out.Result, nil
 }
 
+// DownloadError carries aria2's own error code for a failed download task,
+// so callers can map it to an HTTP status instead of guessing from text.
+type DownloadError struct {
+	Code    int
+	Message string
+}
+
+func (e *DownloadError) Error() string {
+	return fmt.Sprintf("aria2 download failed (errorCode=%d): %s", e.Code, e.Message)
+}
+
+// BasicCreds are basic-auth credentials for a download's initial host, sent
+// only after a 401 challenge - unlike an Authorization header, which aria2
+// would re-send even to a pre-signed redirect target that rejects it.
+type BasicCreds struct {
+	User     string
+	Password string
+}
+
 // Download fetches url into dir/out using multiple connections, optionally
 // verifying the result against a sha-256 checksum via aria2's own
 // --checksum support, and blocks until it completes, fails, or ctx is done.
-// onStart, if non-nil, is invoked once aria2 has accepted and begun the
-// download (i.e. addUri succeeded), before Download blocks on completion.
-func (a *Aria2) Download(ctx context.Context, url string, headers []string, dir, out string, connections int, minSplit string, sha256Hex string, onStart func()) error {
+// A failure aria2 reports for the task itself is returned as a
+// *DownloadError.
+//
+// onStarted fires at most once, on the first real progress (totalLength or
+// completedLength > 0) - never on addUri's gid alone, and never on a 404 or
+// a download that completes before onStarted would fire.
+func (a *Aria2) Download(ctx context.Context, url string, headers []string, creds *BasicCreds, dir, out string, connections int, minSplit string, sha256Hex string, onStarted func(totalLength int64)) error {
 	opts := map[string]interface{}{
 		"dir":                       dir,
 		"out":                       out,
 		"split":                     strconv.Itoa(connections),
 		"max-connection-per-server": strconv.Itoa(connections),
 		"min-split-size":            minSplit,
+		// Default retry-wait=0 exhausts max-tries instantly against a
+		// server throttling parallel connections (e.g. 429s).
+		"retry-wait": "3",
+		"max-tries":  "10",
 	}
 	if len(headers) > 0 {
 		opts["header"] = headers
+	}
+	if creds != nil {
+		// http-auth-challenge defaults to false, which would send creds
+		// to every host including redirect targets - must be explicit.
+		opts["http-user"] = creds.User
+		opts["http-passwd"] = creds.Password
+		opts["http-auth-challenge"] = "true"
 	}
 	if sha256Hex != "" {
 		opts["checksum"] = "sha-256=" + strings.ToLower(sha256Hex)
@@ -217,25 +253,27 @@ func (a *Aria2) Download(ctx context.Context, url string, headers []string, dir,
 		return err
 	}
 
-	if onStart != nil {
-		onStart()
-	}
-
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
+	started := false
 	for {
 		select {
 		case <-ctx.Done():
 			a.call("aria2.remove", []interface{}{gid})
 			return ctx.Err()
 		case <-ticker.C:
-			status, err := a.call("aria2.tellStatus", []interface{}{gid, []string{"status", "errorMessage"}})
+			status, err := a.call("aria2.tellStatus", []interface{}{gid, []string{"status", "totalLength", "completedLength", "errorCode", "errorMessage"}})
 			if err != nil {
 				return err
 			}
+			// aria2 reports totalLength, completedLength and errorCode as
+			// decimal strings, not numbers.
 			var st struct {
-				Status       string `json:"status"`
-				ErrorMessage string `json:"errorMessage"`
+				Status          string `json:"status"`
+				TotalLength     string `json:"totalLength"`
+				CompletedLength string `json:"completedLength"`
+				ErrorCode       string `json:"errorCode"`
+				ErrorMessage    string `json:"errorMessage"`
 			}
 			if err := json.Unmarshal(status, &st); err != nil {
 				return err
@@ -244,9 +282,19 @@ func (a *Aria2) Download(ctx context.Context, url string, headers []string, dir,
 			case "complete":
 				return nil
 			case "error":
-				return fmt.Errorf("aria2 download failed: %s", st.ErrorMessage)
+				code, _ := strconv.Atoi(st.ErrorCode)
+				return &DownloadError{Code: code, Message: st.ErrorMessage}
 			case "removed":
 				return fmt.Errorf("aria2 download was removed")
+			case "active":
+				if onStarted != nil && !started {
+					totalLength, _ := strconv.ParseInt(st.TotalLength, 10, 64)
+					completedLength, _ := strconv.ParseInt(st.CompletedLength, 10, 64)
+					if totalLength > 0 || completedLength > 0 {
+						started = true
+						onStarted(totalLength)
+					}
+				}
 			}
 		}
 	}

@@ -37,4 +37,9 @@ LISTEN_PORT="$(grep -E '^[[:space:]]*listen[[:space:]]*=' "$CONFIG_FILE" | sed -
 [ -z "$LISTEN_PORT" ] && echo "Listening port is not declared" && exit 1
 
 sudo cp "$BIN" "$DEST_BIN"
-sed -e "s|__BIN__|$DEST_BIN|"  -e "s|__PORT__|$LISTEN_PORT|" -e "s|__HOME__|$HOME|" "$SERVICE_TEMPLATE" | sudo tee "$SERVICE_FILE"
+# Service runs as this user; must be in docker group for aria2c access.
+if ! id -nG | tr ' ' '\n' | grep -qx docker; then
+	echo "error: $(id -un) is not in the docker group; the service runs as that user and needs docker access" && exit 1
+fi
+
+sed -e "s|__BIN__|$DEST_BIN|"  -e "s|__PORT__|$LISTEN_PORT|" -e "s|__HOME__|$HOME|" -e "s|__USER__|$(id -un)|" -e "s|__GROUP__|$(id -gn)|" "$SERVICE_TEMPLATE" | sudo tee "$SERVICE_FILE"
