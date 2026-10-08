@@ -1,6 +1,5 @@
 # Registry-proxy - Universal HTTP/HTTPS download cache/proxy speed multiplier
 
-
 ## Problem
 
 Pulling images from a distant registry is slow even on a fast link. Every
@@ -9,7 +8,7 @@ your bandwidth over that kind of latency.
 
 ## Solution
 
-Tool splits each large layer of requested binary into chunks and fetches them in
+This tool splits each large layer of requested binary into chunks and fetches them in
 parallel through [aria2](https://aria2.github.io/) which multiplies
 effective throughput.
 
@@ -214,7 +213,7 @@ Hetzner publishes test files big enough to show the speed difference.
 Substitute whatever host you actually want to route through the proxy - the
 steps are the same.
 
-**1. Add a `127.0.0.1` entry in `/etc/hosts`:
+1. Add a `127.0.0.1` entry in `/etc/hosts`:
 
 ```sh
 127.0.0.1 tyo.download.datapacket.com
@@ -222,7 +221,7 @@ steps are the same.
 
 Every DNS lookup for that hostname now returns localhost.
 
-**2. Redirect ports 80 and 443 to the proxy.** One listen port serves both
+2. **Redirect ports 80 and 443 to the proxy.** One listen port serves both
 protocols: the proxy sniffs the first byte of each connection - `0x16` marks
 a TLS `ClientHello` - and hands it to either the plain or the
 TLS-terminating handler. That's what lets both ports point at the *same*
@@ -236,10 +235,9 @@ sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 443 -j REDIRECT --to-
 `-d 127.0.0.1` scopes each rule to loopback-destined traffic, real outbound HTTPS to other IPs
 is left alone.
 
-
 ## Benchmarks
 
-** Without registry-proxy: **
+**Without registry-proxy:**
 ```sh
 time  wget https://tyo.download.datapacket.com/1000mb.bin
 real	4m19.443s
@@ -247,7 +245,7 @@ user	0m0.109s
 sys	0m0.259s
 ```
 
-** Using registry-proxy: **
+**Using registry-proxy:**
 ```sh
 time  wget https://tyo.download.datapacket.com/1000mb.bin
 real	2m42.123s
@@ -255,9 +253,40 @@ user	0m0.173s
 sys	0m0.499s
 ```
 
-## Caveats:
+## Limitations
+
 1. Some servers don't allow multiple simultaneous connections and chunking.
 Check it before using this tool, try to tune `retry_time` for `aria2c`.
+
+2. Python HTTP/HTTPS clients built on `urllib3` (pip, Conan) don't read the
+system trust store. They use their own bundle, from `certifi`, and ignore
+whatever `update-ca-certificates` installed.
+
+`generate-ca.sh` also writes a combined bundle - the proxy's CA cert plus
+the system's `certifi` bundle - to `~/registry-proxy/ca/combined-ca-bundle.pem`.
+Point Python clients at it:
+
+```sh
+export REQUESTS_CA_BUNDLE=~/registry-proxy/ca/combined-ca-bundle.pem
+export SSL_CERT_FILE=~/registry-proxy/ca/combined-ca-bundle.pem
+```
+
+Regenerate `~/registry-proxy/ca/combined-ca-bundle.pem` after each
+system-wide certificate update, since it's a point-in-time copy of the
+`certifi` bundle, not a live reference to it.
+
+## Caveats
+
+1. Firefox/Chrome keeps its own certificate store rather than reading the
+system one so trusting the CA system-wide (above) isn't enough for it
+either.
+2. Firefox/Chrome HTTP/HTTPS content doesn't load properly dropping some
+content along the way. Consider using DoH-based DNS to avoid the
+`/etc/hosts` proxy redirect until this is fixed.
+
+## Milestones
+1. Support Firefox/Chrome HTTP/HTTPS content.
+2. Support FTP/FTPS protocols.
 
 ## License
 
