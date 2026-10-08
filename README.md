@@ -271,6 +271,23 @@ export REQUESTS_CA_BUNDLE=~/registry-proxy/ca/combined-ca-bundle.pem
 export SSL_CERT_FILE=~/registry-proxy/ca/combined-ca-bundle.pem
 ```
 
+Conan 1.x ignores both of those - its requester hardcodes
+`verify=cacert_path` from its own config, bypassing `requests`' env-var
+lookup. Use `CONAN_CACERT_PATH` instead:
+
+```sh
+export CONAN_CACERT_PATH=~/registry-proxy/ca/combined-ca-bundle.pem
+```
+
+Conan 2.x removed `CONAN_CACERT_PATH`. It only overrides `verify` when
+`core.net.http:cacert_path` is set in `global.conf`; left unset, it falls
+through to plain `requests`, so `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` work
+as-is. To set it explicitly instead:
+
+```sh
+conan config set core.net.http:cacert_path=~/registry-proxy/ca/combined-ca-bundle.pem
+```
+
 Regenerate `~/registry-proxy/ca/combined-ca-bundle.pem` after each
 system-wide certificate update, since it's a point-in-time copy of the
 `certifi` bundle, not a live reference to it.
