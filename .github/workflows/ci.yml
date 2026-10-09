@@ -20,7 +20,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.26.9"
 
       - name: Build aria2 image
         run: docker build -t registry-proxy-aria2:local docker/aria2
