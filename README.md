@@ -83,6 +83,16 @@ ca-dir = ~/registry-proxy/ca
 go build -o registry-proxy ./cmd/registry-proxy
 ```
 
+## CVE check
+
+```sh
+./check-cve.sh
+```
+
+Runs [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck)
+against the module to flag known CVEs in dependencies actually reachable
+from the code. CI runs the same check on every push/PR.
+
 ## Installation
 
 From the repo root:
