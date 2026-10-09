@@ -22,6 +22,13 @@ jobs:
         with:
           go-version: "1.26.9"
 
+      - name: CVE scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/google/osv-scanner/cmd/osv-scanner@latest
+          govulncheck ./...
+          osv-scanner scan -r --no-call-analysis=go .
+
       - name: Build aria2 image
         run: docker build -t registry-proxy-aria2:local docker/aria2
 
@@ -36,10 +43,3 @@ jobs:
 
       - name: Test
         run: go test ./...
-
-      - name: CVE scan
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          go install github.com/google/osv-scanner/cmd/osv-scanner@latest
-          govulncheck ./...
-          osv-scanner scan -r --no-call-analysis=go .
