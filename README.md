@@ -307,9 +307,21 @@ system-wide certificate update, since it's a point-in-time copy of the
 1. Firefox/Chrome keeps its own certificate store rather than reading the
 system one so trusting the CA system-wide (above) isn't enough for it
 either.
-2. Firefox/Chrome HTTP/HTTPS content doesn't load properly dropping some
-content along the way. Consider using DoH-based DNS to avoid the
-`/etc/hosts` proxy redirect until this is fixed.
+2. Firefox/Chrome browsers don't load HTTP/HTTPS content properly dropping some
+content along the way.
+As a workaround, run the browser in [firejail](https://firejail.wordpress.com/) which
+ignores `/etc/hosts` by default so it bypasses the redirect and the proxy entirely:
+
+```sh
+firejail firefox
+firejail google-chrome
+```
+
+Add `--dns=<server>` to pin a specific resolver instead of the default one:
+
+```sh
+firejail --dns=1.1.1.1 firefox
+```
 
 ## Milestones
 1. Support Firefox/Chrome HTTP/HTTPS content.
