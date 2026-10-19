@@ -30,7 +30,16 @@ jobs:
           osv-scanner scan -r --no-call-analysis=go .
 
       - name: Build aria2 image
-        run: docker build -t registry-proxy-aria2:local docker/aria2
+        # public base-image registries 429 shared runner IPs under load;
+        # retry with backoff rather than failing the job on a transient hit.
+        run: |
+          set -eu
+          for attempt in 1 2 3 4 5; do
+            docker build -t registry-proxy-aria2:local docker/aria2 && exit 0
+            echo "build attempt $attempt failed, retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Build
         run: go build ./...
@@ -86,10 +95,17 @@ jobs:
           go-version: "1.26.9"
 
       - name: Build proxy and aria2 image
+        # public base-image registries 429 shared runner IPs under load;
+        # retry with backoff rather than failing the job on a transient hit.
         run: |
-          set -eux
+          set -eu
           go build -o registry-proxy ./cmd/registry-proxy
-          docker build -t registry-proxy-aria2:local docker/aria2
+          for attempt in 1 2 3 4 5; do
+            docker build -t registry-proxy-aria2:local docker/aria2 && exit 0
+            echo "build attempt $attempt failed, retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Generate CA and upstream certificate
         run: |
