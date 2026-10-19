@@ -96,3 +96,102 @@ func TestAuthenticatorDoRoundTrip(t *testing.T) {
 		t.Errorf("token server hit %d times after 2nd call, want still 1 (cached)", tokenRequests)
 	}
 }
+
+// netrcBasic is what writeNetrc's alice:s3cret encodes to.
+const netrcBasic = "Basic YWxpY2U6czNjcmV0"
+
+// TestAuthenticatorTokenRequestSendsNetrcBasicAuth covers a private
+// repository, where the token endpoint authenticates the token request
+// itself and answers an anonymous one with 401 - Artifactory's shape. The
+// credentials have to come from netrc, in this layer: a caller can only set
+// a header on its own request, not on the one token() makes.
+func TestAuthenticatorTokenRequestSendsNetrcBasicAuth(t *testing.T) {
+	var tokenAuth []string
+
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("Authorization")
+		tokenAuth = append(tokenAuth, got)
+		if got == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		fmt.Fprint(w, `{"token":"private-token","expires_in":60}`)
+	}))
+	defer authServer.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer private-token" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token",service="private",scope="repository:x:pull"`, authServer.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer registry.Close()
+
+	a := New(&http.Client{Timeout: 5 * time.Second})
+	if err := a.LoadNetrc(writeNetrc(t, "machine 127.0.0.1 login alice password s3cret\n")); err != nil {
+		t.Fatalf("LoadNetrc: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, registry.URL+"/v2/x/manifests/latest", nil)
+	resp, err := a.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(tokenAuth) == 0 {
+		t.Fatal("token endpoint was never called")
+	}
+	for i, got := range tokenAuth {
+		if got != netrcBasic {
+			t.Errorf("token request %d sent Authorization %q, want %q", i+1, got, netrcBasic)
+		}
+	}
+}
+
+// TestAuthenticatorDoSendsNetrcBasicAuth covers a registry that takes basic
+// auth directly, with no bearer challenge, and checks that a caller which
+// set its own Authorization keeps it.
+func TestAuthenticatorDoSendsNetrcBasicAuth(t *testing.T) {
+	var seen []string
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer registry.Close()
+
+	a := New(&http.Client{Timeout: 5 * time.Second})
+	if err := a.LoadNetrc(writeNetrc(t, "machine 127.0.0.1 login alice password s3cret\n")); err != nil {
+		t.Fatalf("LoadNetrc: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, registry.URL+"/v2/x/manifests/latest", nil)
+	resp, err := a.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+
+	caller, _ := http.NewRequest(http.MethodGet, registry.URL+"/v2/x/manifests/latest", nil)
+	caller.Header.Set("Authorization", "Basic caller-set")
+	resp2, err := a.Do(caller)
+	if err != nil {
+		t.Fatalf("Do (caller-set header): %v", err)
+	}
+	resp2.Body.Close()
+
+	want := []string{netrcBasic, "Basic caller-set"}
+	if len(seen) != len(want) {
+		t.Fatalf("registry saw %d requests, want %d", len(seen), len(want))
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Errorf("request %d sent Authorization %q, want %q", i+1, seen[i], want[i])
+		}
+	}
+}
