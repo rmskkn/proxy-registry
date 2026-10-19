@@ -51,7 +51,14 @@ type Proxy struct {
 // New builds a Proxy backed by cache for blob storage and aria2 for
 // accelerated large-blob downloads.
 func New(cfg *config.Config, c *cache.Cache, a *aria2.Aria2) *Proxy {
-	au := auth.New(&http.Client{Timeout: cfg.HTTPTimeout})
+	// Dials through dialBypassingHosts for the same reason genericClient does:
+	// every request this proxy originates is aimed at an upstream that may be
+	// the very host /etc/hosts points back here, and a hosts-respecting client
+	// would then answer its own request. See realdns.go.
+	au := auth.New(&http.Client{
+		Timeout:   cfg.HTTPTimeout,
+		Transport: &http.Transport{DialContext: dialBypassingHosts},
+	})
 	if cfg.NetrcPath != "" {
 		if err := au.LoadNetrc(cfg.NetrcPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("loading netrc-path %s: %v", cfg.NetrcPath, err)
@@ -111,7 +118,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Plain HTTP side of a transparently redirected host (e.g. port 80
 			// iptables-REDIRECTed here alongside 443): same pipeline as
 			// ServeMITM's TLS side, just without a cert to terminate.
-			p.fetchURL(w, r, "http://"+r.Host+r.URL.RequestURI())
+			p.serveIntercepted(w, r, "http")
 			return
 		}
 		http.NotFound(w, r)
@@ -123,8 +130,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host, repo := registry.ResolveUpstream(req.Name)
-	scheme := registry.UpstreamScheme(p.cfg, host)
+	p.serveV2(w, r, req, registry.UpstreamScheme(p.cfg, host), host, repo)
+}
 
+// serveV2 dispatches one parsed Registry HTTP API v2 request against an
+// already-resolved upstream. Shared by the proxy-style entry point
+// (ServeHTTP, where the upstream comes from the repo name) and the
+// transparently intercepted one (serveIntercepted, where it is the Host
+// header), so both get identical registry semantics.
+func (p *Proxy) serveV2(w http.ResponseWriter, r *http.Request, req *registry.APIRequest, scheme, host, repo string) {
 	switch req.Kind {
 	case "manifest":
 		p.proxyMetadata(w, r, fmt.Sprintf("%s://%s/v2/%s/manifests/%s", scheme, host, repo, req.Arg))
@@ -135,6 +149,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// serveIntercepted handles a request for a host redirected at this proxy
+// out-of-band (/etc/hosts plus an iptables REDIRECT), where the client
+// believes it is talking to the upstream itself. A registry API path is
+// served by the registry handlers - a manifest must not be cached by URL
+// (it is mutable, and its body varies with the client's Accept), and a blob
+// belongs in the digest-keyed cache. Everything else goes through the
+// generic by-URL pipeline, same as /fetch?url=...
+func (p *Proxy) serveIntercepted(w http.ResponseWriter, r *http.Request, scheme string) {
+	if strings.HasPrefix(r.URL.Path, "/v2/") {
+		if req, err := registry.ParseV2Path(r.URL.Path); err == nil {
+			p.serveV2(w, r, req, scheme, r.Host, req.Name)
+			return
+		}
+	}
+	p.fetchURL(w, r, scheme+"://"+r.Host+r.URL.RequestURI())
 }
 
 // proxyMetadata transparently forwards small, non-cacheable registry API
@@ -153,6 +184,7 @@ func (p *Proxy) proxyMetadata(w http.ResponseWriter, r *http.Request, upstreamUR
 	}
 	resp, err := p.auth.Do(req)
 	if err != nil {
+		log.Printf("%s %s failed: %v", r.Method, upstreamURL, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -180,6 +212,7 @@ func (p *Proxy) handleBlob(w http.ResponseWriter, r *http.Request, scheme, host,
 		req, _ := http.NewRequest(http.MethodHead, upstreamURL, nil)
 		resp, err := p.auth.Do(req)
 		if err != nil {
+			log.Printf("HEAD %s failed: %v", upstreamURL, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -244,11 +277,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 // ServeMITM handles a request received over a TLS connection terminated
 // with a locally-trusted CA (see internal/mitmca): any host pointed at the
-// proxy out-of-band (e.g. via /etc/hosts) is fetched and cached exactly
-// like /fetch?url=..., keyed by the URL reconstructed from the request.
+// proxy out-of-band (e.g. via /etc/hosts) is served from the URL
+// reconstructed from the request, by serveIntercepted.
 func (p *Proxy) ServeMITM(w http.ResponseWriter, r *http.Request) {
-	raw := "https://" + r.Host + r.URL.RequestURI()
-	p.fetchURL(w, r, raw)
+	p.serveIntercepted(w, r, "https")
 }
 
 // fetchURL serves raw through the content-addressed-by-URL cache, fetching
@@ -263,7 +295,32 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		w.WriteHeader(http.StatusNotFound)
+		// A cache miss is not proof the upstream lacks it, so ask upstream for
+		// the real status rather than reporting a cache-cold 404 (see
+		// handleBlob's equivalent HEAD fallback).
+		req, err := http.NewRequest(http.MethodHead, raw, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if accept := r.Header.Get("Accept"); accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		if hdr, ok := p.basicAuthFor(raw); ok {
+			req.Header.Set("Authorization", hdr)
+		}
+		resp, err := p.auth.Do(req)
+		if err != nil {
+			log.Printf("HEAD %s failed: %v", raw, err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		copyForwardableHeaders(w.Header(), resp.Header)
+		if v := resp.Header.Get("Content-Length"); v != "" {
+			w.Header().Set("Content-Length", v)
+		}
+		w.WriteHeader(resp.StatusCode)
 		return
 	}
 
@@ -287,7 +344,8 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			if p.cache.Has(cacheKey) { // a concurrent caller may have just finished
 				return nil
 			}
-			headers, err := p.fetchGeneric(r.Context(), raw, cacheKey, onStarted)
+			accept := r.Header.Get("Accept")
+			headers, err := p.fetchGeneric(r.Context(), raw, cacheKey, accept, onStarted)
 			discoveredHeaders = headers
 			return err
 		})
@@ -416,10 +474,13 @@ func ariaUpstreamError(err error) error {
 // own downloads via its own DNS isolation; genericClient does the
 // equivalent for these two direct requests, so their size and headers are
 // trustworthy instead of reflecting the proxy's own 404.
-func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onStarted func(totalLength int64, headers http.Header)) (http.Header, error) {
+func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey, accept string, onStarted func(totalLength int64, headers http.Header)) (http.Header, error) {
 	size := int64(-1)
 	var headers http.Header
 	if headReq, err := http.NewRequest(http.MethodHead, rawURL, nil); err == nil {
+		if accept != "" {
+			headReq.Header.Set("Accept", accept)
+		}
 		if hdr, ok := p.basicAuthFor(rawURL); ok {
 			headReq.Header.Set("Authorization", hdr)
 		}
@@ -436,9 +497,9 @@ func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey string, onSta
 
 	var err error
 	if size >= 0 && size < p.cfg.MinAria2Size {
-		err = p.fetchDirectGeneric(rawURL, cacheKey, size)
+		err = p.fetchDirectGeneric(rawURL, cacheKey, accept, size)
 	} else {
-		err = p.fetchWithAria2Generic(ctx, rawURL, cacheKey, headers, onStarted)
+		err = p.fetchWithAria2Generic(ctx, rawURL, cacheKey, accept, headers, onStarted)
 	}
 	if err == nil {
 		done()
@@ -509,10 +570,13 @@ func decodeHeaders(data []byte) (http.Header, error) {
 	return http.Header(mh), nil
 }
 
-func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64) error {
+func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey, accept string, size int64) error {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
 	}
 	if hdr, ok := p.basicAuthFor(rawURL); ok {
 		req.Header.Set("Authorization", hdr)
@@ -536,7 +600,7 @@ func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey string, size int64) error {
 	return p.cache.Write(cacheKey, data)
 }
 
-func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey string, headers http.Header, onStarted func(totalLength int64, headers http.Header)) error {
+func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey, accept string, headers http.Header, onStarted func(totalLength int64, headers http.Header)) error {
 	dir := p.cache.TmpDir()
 	out := p.cache.TmpName(cacheKey)
 	wrapped := func(totalLength int64) {
@@ -544,7 +608,11 @@ func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey stri
 			onStarted(totalLength, headers)
 		}
 	}
-	if err := p.aria2.Download(ctx, rawURL, nil, p.basicCredsFor(rawURL), dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", wrapped); err != nil {
+	var reqHeaders []string
+	if accept != "" {
+		reqHeaders = append(reqHeaders, "Accept: "+accept)
+	}
+	if err := p.aria2.Download(ctx, rawURL, reqHeaders, p.basicCredsFor(rawURL), dir, out, p.cfg.Aria2Connections, p.cfg.Aria2MinSplit, "", wrapped); err != nil {
 		return ariaUpstreamError(err)
 	}
 	return p.cache.Commit(cacheKey, filepath.Join(dir, out))
