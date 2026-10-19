@@ -14,6 +14,7 @@ import (
 	"hash"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -42,39 +43,46 @@ type Proxy struct {
 	blobGroup *singleflight.Group
 
 	// genericClient is used only by the generic-fetch pipeline (fetchGeneric,
-	// fetchDirectGeneric): it dials through dialBypassingHosts so a host
-	// locally redirected at this proxy still reaches the real upstream when
-	// the proxy itself is the one making the request. See realdns.go.
+	// fetchDirectGeneric). Like p.auth's client it dials through p.dial, so a
+	// host locally redirected at this proxy still reaches the real upstream
+	// when the proxy itself is the one making the request.
 	genericClient *http.Client
+
+	// dial is how every request the proxy originates reaches an upstream.
+	// Defaults to dialBypassingHosts (see realdns.go): a hosts-respecting
+	// dialer would answer the proxy's own request with the proxy, which for a
+	// host redirected here is an endless recursion, not an upstream. Tests
+	// replace it to point a hostname at a stub upstream.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // New builds a Proxy backed by cache for blob storage and aria2 for
 // accelerated large-blob downloads.
 func New(cfg *config.Config, c *cache.Cache, a *aria2.Aria2) *Proxy {
-	// Dials through dialBypassingHosts for the same reason genericClient does:
-	// every request this proxy originates is aimed at an upstream that may be
-	// the very host /etc/hosts points back here, and a hosts-respecting client
-	// would then answer its own request. See realdns.go.
-	au := auth.New(&http.Client{
-		Timeout:   cfg.HTTPTimeout,
-		Transport: &http.Transport{DialContext: dialBypassingHosts},
-	})
+	p := &Proxy{
+		cfg:       cfg,
+		cache:     c,
+		aria2:     a,
+		blobGroup: singleflight.NewGroup(),
+		dial:      dialBypassingHosts,
+	}
+	// Indirect through p.dial rather than capturing it, so a test that
+	// replaces the field after New still affects both clients.
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return p.dial(ctx, network, addr)
+		},
+	}
+	p.genericClient = &http.Client{Timeout: cfg.HTTPTimeout, Transport: transport}
+
+	au := auth.New(&http.Client{Timeout: cfg.HTTPTimeout, Transport: transport})
 	if cfg.NetrcPath != "" {
 		if err := au.LoadNetrc(cfg.NetrcPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("loading netrc-path %s: %v", cfg.NetrcPath, err)
 		}
 	}
-	return &Proxy{
-		cfg:       cfg,
-		cache:     c,
-		aria2:     a,
-		auth:      au,
-		blobGroup: singleflight.NewGroup(),
-		genericClient: &http.Client{
-			Timeout:   cfg.HTTPTimeout,
-			Transport: &http.Transport{DialContext: dialBypassingHosts},
-		},
-	}
+	p.auth = au
+	return p
 }
 
 // basicAuthFor returns an Authorization header value for rawURL's host, from
