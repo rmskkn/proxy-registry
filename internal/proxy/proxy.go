@@ -609,6 +609,12 @@ func (p *Proxy) fetchDirectGeneric(rawURL, cacheKey, accept string, size int64) 
 }
 
 func (p *Proxy) fetchWithAria2Generic(ctx context.Context, rawURL, cacheKey, accept string, headers http.Header, onStarted func(totalLength int64, headers http.Header)) error {
+	if p.aria2 == nil {
+		// New accepts a nil aria2 (tests that only exercise the direct path
+		// pass one), so say which component is missing instead of panicking
+		// several frames into a handler.
+		return errors.New("aria2 is not configured")
+	}
 	dir := p.cache.TmpDir()
 	out := p.cache.TmpName(cacheKey)
 	wrapped := func(totalLength int64) {
