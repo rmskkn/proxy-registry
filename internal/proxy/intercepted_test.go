@@ -35,6 +35,8 @@ const (
 	upstreamToken    = "test-bearer-token"
 	mediaManifestV2  = "application/vnd.docker.distribution.manifest.v2+json"
 	mediaManifestIdx = "application/vnd.docker.distribution.manifest.list.v2+json"
+	mediaManifestV1  = "application/vnd.docker.distribution.manifest.v1+prettyjws"
+	mediaOCIIndex    = "application/vnd.oci.image.index.v1+json"
 )
 
 // interceptedUpstream is a stub private registry shaped like Artifactory:
@@ -45,6 +47,7 @@ type interceptedUpstream struct {
 
 	manifestV2  []byte
 	manifestIdx []byte
+	manifestV1  []byte
 	blob        []byte
 	blobDigest  string
 
@@ -59,6 +62,7 @@ func newInterceptedUpstream(t *testing.T) *interceptedUpstream {
 	u := &interceptedUpstream{
 		manifestV2:  []byte(`{"schemaVersion":2,"mediaType":"` + mediaManifestV2 + `","config":{}}`),
 		manifestIdx: []byte(`{"schemaVersion":2,"mediaType":"` + mediaManifestIdx + `","manifests":[]}`),
+		manifestV1:  []byte(`{"schemaVersion":1,"name":"` + interceptedRepo + `","fsLayers":[]}`),
 		blob:        []byte("blob bytes served over the intercepted path"),
 	}
 	u.blobDigest = "sha256:" + sha256Hex(u.blob)
@@ -83,9 +87,19 @@ func newInterceptedUpstream(t *testing.T) *interceptedUpstream {
 		u.mu.Lock()
 		u.manifestHits++
 		u.mu.Unlock()
-		body, mediaType := u.manifestV2, mediaManifestV2
-		if strings.Contains(r.Header.Get("Accept"), mediaManifestIdx) {
+		// Mirrors registry:2: a client whose Accept names no schema-2 type
+		// gets the manifest rewritten into schema 1 "to support old client",
+		// under a digest that then does not exist in the registry.
+		accept := strings.Join(r.Header.Values("Accept"), ", ")
+		var body []byte
+		var mediaType string
+		switch {
+		case strings.Contains(accept, mediaManifestIdx):
 			body, mediaType = u.manifestIdx, mediaManifestIdx
+		case strings.Contains(accept, mediaManifestV2):
+			body, mediaType = u.manifestV2, mediaManifestV2
+		default:
+			body, mediaType = u.manifestV1, mediaManifestV1
 		}
 		w.Header().Set("Content-Type", mediaType)
 		w.Header().Set("Docker-Content-Digest", "sha256:"+sha256Hex(body))
@@ -288,6 +302,40 @@ func TestInterceptedManifestNotCachedAndVariesWithAccept(t *testing.T) {
 
 	if manifests, _ := up.counts(); manifests != 2 {
 		t.Errorf("upstream manifest hits = %d, want 2 (a manifest must not be cached)", manifests)
+	}
+}
+
+// TestInterceptedManifestForwardsEveryAcceptHeader covers how docker states
+// the manifest types it understands: several separate Accept header lines,
+// not one list. Forwarding only the first (what Header.Get returns) left
+// this registry believing the client understood nothing newer than schema 1,
+// so it rewrote the manifest - and the digest it then advertised did not
+// exist, which is what broke a real pull.
+func TestInterceptedManifestForwardsEveryAcceptHeader(t *testing.T) {
+	up := newInterceptedUpstream(t)
+	_, srv, _ := newInterceptedProxy(t, up)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+manifestPath(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = interceptedHost
+	// Order matters: the type this registry does not serve comes first.
+	req.Header.Add("Accept", mediaOCIIndex)
+	req.Header.Add("Accept", mediaManifestV2)
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", manifestPath(), err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Content-Type"); got != mediaManifestV2 {
+		t.Errorf("Content-Type = %q, want %q (upstream saw a truncated Accept)", got, mediaManifestV2)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != string(up.manifestV2) {
+		t.Errorf("body = %q, want %q", body, up.manifestV2)
 	}
 }
 

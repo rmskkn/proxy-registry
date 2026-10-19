@@ -176,6 +176,16 @@ func (p *Proxy) serveIntercepted(w http.ResponseWriter, r *http.Request, scheme 
 	p.fetchURL(w, r, scheme+"://"+r.Host+r.URL.RequestURI())
 }
 
+// acceptOf returns a client's whole Accept list as one field value. docker
+// sends the manifest media types it understands as several separate Accept
+// header lines, and Header.Get returns only the first - forwarding that one
+// makes a registry believe the client understands nothing else, which is
+// enough for it to rewrite a schema-2 manifest into schema 1 ("to support
+// old client") and hand back a digest the client then cannot fetch.
+func acceptOf(r *http.Request) string {
+	return strings.Join(r.Header.Values("Accept"), ", ")
+}
+
 // proxyMetadata transparently forwards small, non-cacheable registry API
 // calls (manifests, tag listings) to the upstream, preserving the Accept
 // header docker uses to pick a manifest schema and the digest/content-type
@@ -187,7 +197,7 @@ func (p *Proxy) proxyMetadata(w http.ResponseWriter, r *http.Request, upstreamUR
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	if accept := r.Header.Get("Accept"); accept != "" {
+	if accept := acceptOf(r); accept != "" {
 		req.Header.Set("Accept", accept)
 	}
 	resp, err := p.auth.Do(req)
@@ -311,7 +321,7 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		if accept := r.Header.Get("Accept"); accept != "" {
+		if accept := acceptOf(r); accept != "" {
 			req.Header.Set("Accept", accept)
 		}
 		if hdr, ok := p.basicAuthFor(raw); ok {
@@ -352,7 +362,7 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			if p.cache.Has(cacheKey) { // a concurrent caller may have just finished
 				return nil
 			}
-			accept := r.Header.Get("Accept")
+			accept := acceptOf(r)
 			headers, err := p.fetchGeneric(r.Context(), raw, cacheKey, accept, onStarted)
 			discoveredHeaders = headers
 			return err
