@@ -62,3 +62,175 @@ jobs:
       - uses: github/codeql-action/autobuild@v3
 
       - uses: github/codeql-action/analyze@v3
+
+  # End-to-end pull through the deployment shape the unit tests can only
+  # simulate: a real docker client, a real registry upstream, the upstream's
+  # hostname redirected at the proxy with /etc/hosts plus an iptables
+  # REDIRECT, and TLS terminated by the proxy's own CA. Needs root, so it
+  # lives in its own job.
+  e2e-docker-pull:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_IP: 127.0.0.2 # the real address registry.test resolves to
+      # dnsmasq, the "real nameserver" the proxy queries. Not .53 or .54:
+      # systemd-resolved holds both as stub listeners, and dnsmasq exits 2
+      # when it cannot bind.
+      STUB_DNS_IP: 127.0.0.44
+      REGISTRY_HOST: registry.test
+      PROXY_PORT: "5000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.9"
+
+      - name: Build proxy and aria2 image
+        run: |
+          set -eux
+          go build -o registry-proxy ./cmd/registry-proxy
+          docker build -t registry-proxy-aria2:local docker/aria2
+
+      - name: Generate CA and upstream certificate
+        run: |
+          set -eux
+          mkdir -p ca
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+            -keyout ca/ca-key.pem -out ca/ca-cert.pem \
+            -subj "/CN=registry-proxy e2e CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature"
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout ca/upstream-key.pem -out ca/upstream.csr \
+            -subj "/CN=$REGISTRY_HOST"
+          openssl x509 -req -in ca/upstream.csr -sha256 -days 1 \
+            -CA ca/ca-cert.pem -CAkey ca/ca-key.pem -CAcreateserial \
+            -extfile <(printf 'subjectAltName=DNS:%s,IP:%s\n' "$REGISTRY_HOST" "$UPSTREAM_IP") \
+            -out ca/upstream-cert.pem
+
+      - name: Trust the CA (host, docker, aria2 container)
+        run: |
+          set -eux
+          sudo cp ca/ca-cert.pem /usr/local/share/ca-certificates/registry-proxy-e2e.crt
+          sudo update-ca-certificates
+          for host in "$REGISTRY_HOST" "$UPSTREAM_IP"; do
+            sudo mkdir -p "/etc/docker/certs.d/$host"
+            sudo cp ca/ca-cert.pem "/etc/docker/certs.d/$host/ca.crt"
+          done
+          # aria2 runs in a container with its own trust store, and the
+          # production image has no reason to carry a test CA - bake it into a
+          # throwaway layer on top instead.
+          printf 'FROM registry-proxy-aria2:local\nCOPY ca/ca-cert.pem /usr/local/share/ca-certificates/registry-proxy-e2e.crt\nRUN apk add --no-cache ca-certificates && update-ca-certificates\n' > ca.Dockerfile
+          docker build -t registry-proxy-aria2:local -f ca.Dockerfile .
+
+      - name: Start upstream registry and push a test image
+        run: |
+          set -eux
+          docker run -d --name upstream \
+            -p "$UPSTREAM_IP:443:443" \
+            -v "$PWD/ca:/certs:ro" \
+            -e REGISTRY_HTTP_ADDR=0.0.0.0:443 \
+            -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/upstream-cert.pem \
+            -e REGISTRY_HTTP_TLS_KEY=/certs/upstream-key.pem \
+            registry:2
+          for _ in $(seq 1 30); do
+            curl -fsS "https://$UPSTREAM_IP/v2/" >/dev/null && break
+            sleep 1
+          done
+          # A layer big enough to take the aria2 path, not the direct one.
+          mkdir -p image-context
+          head -c 10485760 /dev/urandom > image-context/payload.bin
+          printf 'FROM scratch\nCOPY payload.bin /payload.bin\n' > image-context/Dockerfile
+          docker build -t "$UPSTREAM_IP/test/img:1" image-context
+          docker push "$UPSTREAM_IP/test/img:1"
+          docker image inspect "$UPSTREAM_IP/test/img:1" --format '{{.Id}}' > expected-image-id
+          docker rmi "$UPSTREAM_IP/test/img:1"
+
+      - name: Redirect the registry hostname at the proxy
+        run: |
+          set -eux
+          # dnsmasq answers for the proxy (and for aria2, which gets this same
+          # nameserver), so the hostname resolves to the real upstream rather
+          # than to the proxy that /etc/hosts points clients at.
+          sudo apt-get update
+          sudo apt-get install -y dnsmasq dnsutils
+          # The package starts a service bound to port 53 on every address,
+          # which would both conflict with ours and answer nothing useful.
+          sudo systemctl disable --now dnsmasq || true
+          sudo dnsmasq --no-resolv --bind-interfaces \
+            --listen-address="$STUB_DNS_IP" \
+            --address="/$REGISTRY_HOST/$UPSTREAM_IP" \
+            --server=1.1.1.1
+          # Fail here, with the answer in the log, rather than later as an
+          # unexplained pull error.
+          dig @"$STUB_DNS_IP" +short "$REGISTRY_HOST"
+          test "$(dig @"$STUB_DNS_IP" +short "$REGISTRY_HOST")" = "$UPSTREAM_IP"
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver %s\n' "$STUB_DNS_IP" | sudo tee /etc/resolv.conf
+          printf '127.0.0.1 %s\n' "$REGISTRY_HOST" | sudo tee -a /etc/hosts
+          sudo iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 443 \
+            -j REDIRECT --to-port "$PROXY_PORT"
+
+      - name: Start the proxy
+        run: |
+          set -eux
+          mkdir -p "$HOME/registry-proxy/cache"
+          cat > "$HOME/registry-proxy/config" <<EOF
+          listen = :$PROXY_PORT
+          cache-dir = $HOME/registry-proxy/cache
+          ca-dir = $PWD/ca
+          mitm-tls = true
+          min-aria2-size = 1048576
+          aria2-connections = 4
+          aria2-min-split-size = 1M
+          http-timeout = 60s
+          EOF
+          ./registry-proxy > proxy.log 2>&1 &
+          for _ in $(seq 1 30); do
+            ss -ltn | grep -q ":$PROXY_PORT" && break
+            sleep 1
+          done
+          ss -ltn | grep ":$PROXY_PORT"
+
+      # docker reports a bad manifest only as "does not conform to the
+      # distribution registry specification", which does not say which
+      # response was wrong. These three requests are what it makes first, so
+      # their status and headers name the culprit directly.
+      - name: Probe the registry API through the proxy
+        run: |
+          set -eux
+          curl -sS -D- -o /dev/null "https://$REGISTRY_HOST/v2/"
+          digest=$(curl -sS -D- -o /dev/null \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://$REGISTRY_HOST/v2/test/img/manifests/1" \
+            | tee /dev/stderr | tr -d '\r' | awk '/^[Dd]ocker-[Cc]ontent-[Dd]igest:/ {print $2}')
+          test -n "$digest"
+          curl -sS -D- -o manifest.json \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://$REGISTRY_HOST/v2/test/img/manifests/$digest"
+          head -c 400 manifest.json
+
+      - name: Pull the image through the proxy
+        run: |
+          set -eux
+          timeout 300 docker pull "$REGISTRY_HOST/test/img:1"
+          docker image inspect "$REGISTRY_HOST/test/img:1" --format '{{.Id}}' > actual-image-id
+          diff expected-image-id actual-image-id
+
+      - name: Check the pull did not recurse and did cache blobs
+        run: |
+          set -eux
+          # The recursion this guards against produced ~150k log lines in
+          # five minutes; a healthy pull of a two-blob image produces a
+          # handful.
+          lines=$(wc -l < proxy.log)
+          test "$lines" -lt 200 || { echo "proxy logged $lines lines, expected a handful"; exit 1; }
+          test -n "$(ls -A "$HOME/registry-proxy/cache/blobs")"
+
+      - name: Proxy log
+        if: always()
+        run: tail -n 100 proxy.log || true
+
+      - name: Upstream registry log
+        if: always()
+        run: docker logs upstream 2>&1 | tail -n 50 || true
