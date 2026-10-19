@@ -127,7 +127,17 @@ func (a *Authenticator) token(realm, service, scope string) (string, error) {
 	}
 	u.RawQuery = q.Encode()
 
-	resp, err := a.Client.Get(u.String())
+	tokReq, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	// A private repository's token endpoint authenticates the token request
+	// itself (Artifactory answers an anonymous one with 401), so send the
+	// realm host's netrc credentials when we have them.
+	if hdr, ok := a.BasicAuth(u.Hostname()); ok {
+		tokReq.Header.Set("Authorization", hdr)
+	}
+	resp, err := a.Client.Do(tokReq)
 	if err != nil {
 		return "", err
 	}
@@ -164,6 +174,15 @@ func (a *Authenticator) token(realm, service, scope string) (string, error) {
 // URL, and headers (req itself may already have been consumed by the first
 // attempt, so it is never reused directly).
 func (a *Authenticator) Do(req *http.Request) (*http.Response, error) {
+	// Netrc credentials for the target host, unless the caller already set an
+	// Authorization header: a private registry that answers with a Bearer
+	// challenge needs them, and one that takes basic auth directly is served
+	// by this alone.
+	if req.Header.Get("Authorization") == "" {
+		if hdr, ok := a.BasicAuth(req.URL.Hostname()); ok {
+			req.Header.Set("Authorization", hdr)
+		}
+	}
 	resp, err := a.Client.Do(req)
 	if err != nil {
 		return nil, err
