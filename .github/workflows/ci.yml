@@ -23,9 +23,20 @@ jobs:
           go-version: "1.26.9"
 
       - name: CVE scan
+        # go install hits sum.golang.org to verify modules; retry on
+        # transient sumdb network errors rather than failing the job.
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          go install github.com/google/osv-scanner/cmd/osv-scanner@latest
+          set -eu
+          install() {
+            for attempt in 1 2 3 4 5; do
+              go install "$1" && return 0
+              echo "install $1 attempt $attempt failed, retrying in $((attempt * 10))s"
+              sleep $((attempt * 10))
+            done
+            return 1
+          }
+          install golang.org/x/vuln/cmd/govulncheck@latest
+          install github.com/google/osv-scanner/cmd/osv-scanner@latest
           govulncheck ./...
           osv-scanner scan -r --no-call-analysis=go .
 
