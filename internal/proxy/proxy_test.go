@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -110,6 +112,35 @@ func TestProxyManifestPassthrough(t *testing.T) {
 	}
 	if resp.Header.Get("Docker-Content-Digest") == "" {
 		t.Error("Docker-Content-Digest not forwarded")
+	}
+}
+
+// TestProxyManifestNotFoundIsLogged: an upstream 404 (e.g. a tag that was
+// never published) is a successful round trip from p.auth.Do's point of
+// view, not an error - proxyMetadata used to log nothing at all for it,
+// leaving a failed pull with no trace in the proxy's own log.
+func TestProxyManifestNotFoundIsLogged(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	_, srv := newTestProxy(t, hostPort(t, upstream))
+
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	resp, err := http.Get(srv.URL + "/v2/" + hostPort(t, upstream) + "/myrepo/manifests/0.0.75")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	if !strings.Contains(logBuf.String(), "404") {
+		t.Errorf("proxy log = %q, want it to mention the upstream's 404", logBuf.String())
 	}
 }
 

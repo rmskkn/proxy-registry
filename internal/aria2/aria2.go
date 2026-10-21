@@ -5,10 +5,13 @@
 package aria2
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -85,11 +88,23 @@ func Start(cfg *config.Config) (*Aria2, error) {
 		"--continue=true",
 	}
 	cmd := exec.Command("docker", dockerArgs...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		os.RemoveAll(dnsDir)
+		return nil, fmt.Errorf("piping aria2c stdout: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		os.RemoveAll(dnsDir)
+		return nil, fmt.Errorf("piping aria2c stderr: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		os.RemoveAll(dnsDir)
 		return nil, fmt.Errorf("starting aria2c: %w", err)
 	}
+	go streamAria2Log(stdout)
+	go streamAria2Log(stderr)
 	a := &Aria2{
 		rpcURL:        fmt.Sprintf("http://127.0.0.1:%d/jsonrpc", cfg.Aria2RPCPort),
 		http:          &http.Client{Timeout: 10 * time.Second},
@@ -109,6 +124,23 @@ func Start(cfg *config.Config) (*Aria2, error) {
 	}
 	a.Stop()
 	return nil, fmt.Errorf("aria2c RPC did not become ready: %w", lastErr)
+}
+
+// streamAria2Log copies aria2c's own stdout/stderr lines into the proxy's
+// log, prefixed so they're distinguishable from the proxy's own entries.
+// Without this, aria2c's diagnostics (its [ERROR]/[NOTICE] lines, with the
+// errorCode that DownloadError only summarizes) were visible only via
+// `docker logs` against the daemon's container - see .claude/skills/aria2-logs.
+func streamAria2Log(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		if line := scanner.Text(); line != "" {
+			log.Printf("aria2c: %s", line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("aria2c: log stream closed: %v", err)
+	}
 }
 
 // writeDNSIsolationFiles writes an empty hosts file and a resolv.conf
