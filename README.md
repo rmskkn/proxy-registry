@@ -302,6 +302,17 @@ Regenerate `~/registry-proxy/ca/combined-ca-bundle.pem` after each
 system-wide certificate update, since it's a point-in-time copy of the
 `certifi` bundle, not a live reference to it.
 
+3. **No client authentication.** The proxy's listener - the registry API,
+`/fetch?url=...`, and the MITM path - serves anyone who can reach it, and
+attaches whatever netrc credentials are configured for the request's
+resolved host. It does not check who is asking. Deploy it only on a network
+segment reachable solely by clients you intend to grant that access; do not
+point `listen` at an interface reachable from an untrusted network. (The
+blob cache separately re-checks upstream authorization on every request, so
+a digest cached by one pull can't outlive the access that fetched it, but
+that narrows only the cache - it is not a substitute for this network-level
+trust boundary.)
+
 ## Caveats
 
 1. Firefox/Chrome keeps its own certificate store rather than reading the

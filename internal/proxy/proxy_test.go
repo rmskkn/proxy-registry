@@ -120,7 +120,8 @@ type blobUpstream struct {
 	registry *httptest.Server
 	storage  *httptest.Server
 	digest   string
-	hits     int32 // storage hits
+	hits     int32 // storage hits, any method
+	getHits  int32 // storage hits that actually transferred the body
 }
 
 func newBlobUpstream(t *testing.T, content []byte) *blobUpstream {
@@ -134,6 +135,7 @@ func newBlobUpstream(t *testing.T, content []byte) *blobUpstream {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		atomic.AddInt32(&b.getHits, 1)
 		w.WriteHeader(http.StatusOK)
 		w.Write(content)
 	}))
@@ -198,7 +200,14 @@ func TestProxyBlobDigestMismatchRejected(t *testing.T) {
 	}
 }
 
-func TestProxyBlobHeadServedFromCacheWithoutUpstream(t *testing.T) {
+// TestProxyBlobHeadCacheHitReauthorizesUpstream: a cache hit alone must not
+// be enough to answer a HEAD, since the blob cache is shared by every
+// caller regardless of which repo/host they resolved to - a digest another
+// caller's authorized pull put there is not proof *this* caller is
+// authorized against the upstream it resolved to. So a cache-hit HEAD still
+// re-checks the upstream, and an upstream auth failure must be surfaced
+// rather than served from cache.
+func TestProxyBlobHeadCacheHitReauthorizesUpstream(t *testing.T) {
 	content := []byte("cached blob for HEAD test")
 	up := newBlobUpstream(t, content)
 	p, srv := newTestProxy(t, hostPort(t, up.registry))
@@ -213,8 +222,7 @@ func TestProxyBlobHeadServedFromCacheWithoutUpstream(t *testing.T) {
 		t.Fatal("precondition failed: blob should be cached")
 	}
 
-	// Kill the registry so any HEAD that actually reaches upstream fails loudly.
-	up.registry.Close()
+	registryHitsBeforeHead := atomic.LoadInt32(&up.hits)
 
 	resp, err := http.Head(digestURL)
 	if err != nil {
@@ -222,10 +230,65 @@ func TestProxyBlobHeadServedFromCacheWithoutUpstream(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("HEAD status = %d, want 200 (served from cache)", resp.StatusCode)
+		t.Fatalf("HEAD status = %d, want 200 (cache hit, upstream still authorized)", resp.StatusCode)
 	}
 	if got := resp.Header.Get("Content-Length"); got != fmt.Sprintf("%d", len(content)) {
 		t.Errorf("Content-Length = %q, want %d", got, len(content))
+	}
+	if atomic.LoadInt32(&up.hits) == registryHitsBeforeHead {
+		t.Error("HEAD on a cache hit did not re-check the upstream")
+	}
+
+	// Now make the upstream deny the blob: a cache hit must not paper over
+	// that - the whole point is that the cache can't be trusted alone.
+	up.registry.Close()
+
+	resp2, err := http.Head(digestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadGateway {
+		t.Errorf("HEAD status after upstream went away = %d, want 502 (cache hit must not bypass authorization)", resp2.StatusCode)
+	}
+}
+
+// TestProxyBlobGetCacheHitDeniedWhenUpstreamRevokesAccess: the blob cache is
+// shared by every caller regardless of which repo/host they resolved to, so
+// a digest cached from one authorized pull must not go on being served to
+// callers the upstream would now deny - a cache hit re-checks the upstream
+// on every GET, not just the first one.
+func TestProxyBlobGetCacheHitDeniedWhenUpstreamRevokesAccess(t *testing.T) {
+	content := []byte("blob whose access gets revoked after caching")
+	up := newBlobUpstream(t, content)
+	p, srv := newTestProxy(t, hostPort(t, up.registry))
+
+	digestURL := srv.URL + "/v2/" + hostPort(t, up.registry) + "/x/blobs/" + up.digest
+	resp, err := http.Get(digestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial GET status = %d, want 200", resp.StatusCode)
+	}
+	if !p.cache.Has(up.digest) {
+		t.Fatal("precondition failed: blob should be cached")
+	}
+
+	// Upstream now denies the blob (e.g. a different caller's resolved
+	// repo/token no longer authorizes it) instead of redirecting to storage.
+	up.registry.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+
+	resp2, err := http.Get(digestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadGateway {
+		t.Errorf("GET after upstream revoked access = %d, want 502 (cache hit must not bypass authorization)", resp2.StatusCode)
 	}
 }
 
@@ -261,8 +324,15 @@ func TestProxyBlobSingleflightDedupesConcurrentFetches(t *testing.T) {
 	}
 	// The storage server (final hop) should only have been hit once for the
 	// GET (plus once for the HEAD resolution before the singleflight'd fetch).
-	if hits := atomic.LoadInt32(&up.hits); hits > 2 {
-		t.Errorf("storage hit %d times, want at most 2 (one HEAD + one GET) despite %d concurrent callers", hits, len(results))
+	// The real transfer (the GET that actually moves the body) must happen
+	// exactly once no matter how many callers raced for it - that's what
+	// singleflight dedup guarantees. A concurrent caller that lands on an
+	// already-cached digest still re-checks upstream authorization (a
+	// HEAD, via authorizeBlob) rather than trusting the cache for free, so
+	// the total hit count can exceed 2 - that's the fix for the shared
+	// cache, not a dedup failure.
+	if gets := atomic.LoadInt32(&up.getHits); gets != 1 {
+		t.Errorf("storage GET hit %d times, want exactly 1 despite %d concurrent callers", gets, len(results))
 	}
 }
 

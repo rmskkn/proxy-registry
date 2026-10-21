@@ -221,6 +221,11 @@ func (p *Proxy) handleBlob(w http.ResponseWriter, r *http.Request, scheme, host,
 
 	if r.Method == http.MethodHead {
 		if fi, err := p.cache.Stat(digest); err == nil {
+			if authErr := p.authorizeBlob(upstreamURL); authErr != nil {
+				log.Printf("blob authorization failed for %s: %v", upstreamURL, authErr)
+				http.Error(w, "failed to authorize blob against upstream", http.StatusBadGateway)
+				return
+			}
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", fi.Size()))
 			w.Header().Set("Docker-Content-Digest", digest)
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -247,7 +252,7 @@ func (p *Proxy) handleBlob(w http.ResponseWriter, r *http.Request, scheme, host,
 	if !p.cache.Has(digest) {
 		err := p.blobGroup.Do(digest, func() error {
 			if p.cache.Has(digest) { // a concurrent caller may have just finished
-				return nil
+				return p.authorizeBlob(upstreamURL)
 			}
 			return p.fetchBlob(r.Context(), upstreamURL, digest)
 		})
@@ -256,8 +261,34 @@ func (p *Proxy) handleBlob(w http.ResponseWriter, r *http.Request, scheme, host,
 			http.Error(w, "failed to fetch blob from upstream", http.StatusBadGateway)
 			return
 		}
+	} else if err := p.authorizeBlob(upstreamURL); err != nil {
+		log.Printf("blob authorization failed for %s: %v", upstreamURL, err)
+		http.Error(w, "failed to authorize blob against upstream", http.StatusBadGateway)
+		return
 	}
 	p.serveCached(w, r, digest)
+}
+
+// authorizeBlob re-checks the upstream's own authorization for upstreamURL
+// via a HEAD request before a cache hit is served. The blob cache is a
+// single digest-keyed store shared by every caller regardless of which
+// repo/host they resolved to, so a cache hit alone is not proof that *this*
+// caller is authorized against the upstream it resolved to - only that some
+// caller, at some point, was.
+func (p *Proxy) authorizeBlob(upstreamURL string) error {
+	req, err := http.NewRequest(http.MethodHead, upstreamURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := p.auth.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("upstream HEAD returned %s", resp.Status)
+	}
+	return nil
 }
 
 // serveCached streams a cached blob to the client. http.ServeContent handles
@@ -309,6 +340,7 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 
 	if r.Method == http.MethodHead {
 		if fi, err := p.cache.Stat(cacheKey); err == nil {
+			log.Printf("cache hit (HEAD) for %s", raw)
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", fi.Size()))
 			w.WriteHeader(http.StatusOK)
 			return
@@ -360,6 +392,7 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 		}
 		err := p.blobGroup.Do(cacheKey, func() error {
 			if p.cache.Has(cacheKey) { // a concurrent caller may have just finished
+				log.Printf("cache hit for %s (fetched by a concurrent request)", raw)
 				return nil
 			}
 			accept := acceptOf(r)
@@ -384,6 +417,8 @@ func (p *Proxy) fetchURL(w http.ResponseWriter, r *http.Request, raw string) {
 			http.Error(w, "failed to fetch url", http.StatusBadGateway)
 			return
 		}
+	} else {
+		log.Printf("cache hit for %s", raw)
 	}
 
 	if headerSent {
@@ -507,7 +542,12 @@ func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey, accept strin
 			if resp.StatusCode == http.StatusOK {
 				size = resp.ContentLength
 				headers = resp.Header
+				log.Printf("preflight HEAD %s: size=%d", rawURL, size)
+			} else {
+				log.Printf("preflight HEAD %s: upstream returned %s", rawURL, resp.Status)
 			}
+		} else {
+			log.Printf("preflight HEAD %s failed: %v", rawURL, err)
 		}
 	}
 
@@ -515,8 +555,10 @@ func (p *Proxy) fetchGeneric(ctx context.Context, rawURL, cacheKey, accept strin
 
 	var err error
 	if size >= 0 && size < p.cfg.MinAria2Size {
+		log.Printf("fetching %s directly (size=%d below min-aria2-size=%d)", rawURL, size, p.cfg.MinAria2Size)
 		err = p.fetchDirectGeneric(rawURL, cacheKey, accept, size)
 	} else {
+		log.Printf("fetching %s via aria2 (size=%d)", rawURL, size)
 		err = p.fetchWithAria2Generic(ctx, rawURL, cacheKey, accept, headers, onStarted)
 	}
 	if err == nil {
