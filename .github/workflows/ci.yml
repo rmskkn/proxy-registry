@@ -42,7 +42,7 @@ jobs:
         run: test -z "$(gofmt -l .)"
 
       - name: Test
-        run: go test ./...
+        run: go test ./... -race -count=1
 
   codeql:
     runs-on: ubuntu-latest
