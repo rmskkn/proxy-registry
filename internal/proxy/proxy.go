@@ -207,6 +207,7 @@ func (p *Proxy) proxyMetadata(w http.ResponseWriter, r *http.Request, upstreamUR
 		return
 	}
 	defer resp.Body.Close()
+	log.Printf("%s %s -> %s", r.Method, upstreamURL, resp.Status)
 	for _, h := range []string{"Content-Type", "Docker-Content-Digest", "Docker-Distribution-Api-Version", "Content-Length"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
