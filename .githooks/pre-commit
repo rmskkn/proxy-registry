@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Runs the same checks CI's build job runs, before a commit is allowed to
+# land. Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-commit: CVE scan"
+./check-cve.sh
+
+echo "pre-commit: build"
+go build ./...
+
+echo "pre-commit: vet"
+go vet ./...
+
+echo "pre-commit: format check"
+unformatted="$(gofmt -l .)"
+if [ -n "$unformatted" ]; then
+	echo "gofmt needs to be run on:" >&2
+	echo "$unformatted" >&2
+	exit 1
+fi
+
+echo "pre-commit: test"
+go test ./... -race -count=1
