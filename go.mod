@@ -1,6 +1,6 @@
 module registry-proxy
 
-go 1.26.9
+go 1.26.10
 
 require github.com/miekg/dns v1.1.62
 

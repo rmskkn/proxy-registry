@@ -20,7 +20,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.9"
+          go-version: "1.26.10"
 
       - name: CVE scan
         # go install hits sum.golang.org to verify modules; retry on
@@ -73,7 +73,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.9"
+          go-version: "1.26.10"
 
       - uses: github/codeql-action/init@v3
         with:
@@ -103,7 +103,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.9"
+          go-version: "1.26.10"
 
       - name: Build proxy and aria2 image
         # public base-image registries 429 shared runner IPs under load;
