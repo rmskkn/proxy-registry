@@ -159,7 +159,11 @@ jobs:
           mkdir -p image-context
           head -c 10485760 /dev/urandom > image-context/payload.bin
           printf 'FROM scratch\nCOPY payload.bin /payload.bin\n' > image-context/Dockerfile
-          docker build -t "$UPSTREAM_IP/test/img:1" image-context
+          # buildx attaches provenance/SBOM attestations by default, which
+          # turns the pushed tag into a manifest list instead of a plain
+          # v2 manifest - the exact thing the probe step below requests.
+          docker build --provenance=false --sbom=false \
+            -t "$UPSTREAM_IP/test/img:1" image-context
           docker push "$UPSTREAM_IP/test/img:1"
           docker image inspect "$UPSTREAM_IP/test/img:1" --format '{{.Id}}' > expected-image-id
           docker rmi "$UPSTREAM_IP/test/img:1"
