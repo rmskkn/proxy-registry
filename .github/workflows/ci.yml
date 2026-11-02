@@ -26,22 +26,7 @@ jobs:
           go-version: "1.26.10"
 
       - name: CVE scan
-        # go install hits sum.golang.org to verify modules; retry on
-        # transient sumdb network errors rather than failing the job.
-        run: |
-          set -eu
-          install() {
-            for attempt in 1 2 3 4 5; do
-              go install "$1" && return 0
-              echo "install $1 attempt $attempt failed, retrying in $((attempt * 10))s"
-              sleep $((attempt * 10))
-            done
-            return 1
-          }
-          install golang.org/x/vuln/cmd/govulncheck@latest
-          install github.com/google/osv-scanner/cmd/osv-scanner@latest
-          govulncheck ./...
-          osv-scanner scan -r --no-call-analysis=go .
+        run: make cve
 
       - uses: docker/login-action@v3
         with:
@@ -56,16 +41,16 @@ jobs:
           docker tag ghcr.io/${{ github.repository }}/aria2:3.20 registry-proxy-aria2:local
 
       - name: Build
-        run: go build ./...
+        run: make build
 
       - name: Vet
-        run: go vet ./...
+        run: make vet
 
       - name: Format check
-        run: test -z "$(gofmt -l .)"
+        run: make fmt-check
 
       - name: Test
-        run: go test ./... -race -count=1
+        run: make test-race
 
   codeql:
     runs-on: ubuntu-latest
@@ -120,7 +105,7 @@ jobs:
       - name: Build proxy and pull aria2 image
         run: |
           set -eux
-          go build -o registry-proxy ./cmd/registry-proxy
+          make build
           docker pull ghcr.io/${{ github.repository }}/aria2:3.20
           docker tag ghcr.io/${{ github.repository }}/aria2:3.20 registry-proxy-aria2:local
 
