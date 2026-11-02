@@ -14,20 +14,20 @@ effective throughput.
 
 ## Key features
 
-- **Redirect-aware blob fetch**: the final CDN URL is resolved before the
+- Redirect-aware blob fetch: the final CDN URL is resolved before the
   download starts. net/http drops the registry's bearer token on cross-host
   redirects, so it never reaches a third party.
-- **aria2-accelerated downloads**: blobs at or above `min-aria2-size` go
+- aria2-accelerated downloads: blobs at or above `min-aria2-size` go
   through aria2's `--split`/`--max-connection-per-server`. Smaller ones are
   fetched directly, where the parallelism would only add overhead.
-- **DNS-isolated aria2 RPC server**: aria2c always runs inside a container (see
+- DNS-isolated aria2 RPC server: aria2c always runs inside a container (see
   `docker/aria2`), with `/etc/hosts` emptied and `/etc/resolv.conf` pinned
-  to the host's real nameserver providing isolation.
-- **Content-addressed cache**: blobs are keyed by digest, so a layer shared
+  to the host's real nameserver for isolation.
+- Content-addressed cache: blobs are keyed by digest, so a layer shared
   across repos or registries is downloaded once. sha256 blobs are verified
   by aria2's own `--checksum`, and concurrent requests for the same digest
   share a single in-flight download.
-- **Generic downloads**: `/fetch?url=...` sends any HTTP/HTTPS URL through
+- Generic downloads: `/fetch?url=...` sends any HTTP/HTTPS URL through
   the same accelerated, cached pipeline, keyed by the URL's sha256.
 
 Manifests and tag listings pass through unmodified and uncached.
@@ -218,8 +218,8 @@ Then follow the trust-store install instructions it prints at the end.
 
 ## How to use
 
-Everything below uses `ash-speed.hetzner.com` as the example host, because
-Hetzner publishes test files big enough to show the speed difference.
+Everything below uses `tyo.download.datapacket.com` as the example host,
+because it serves test files big enough to show the speed difference.
 Substitute whatever host you actually want to route through the proxy - the
 steps are the same.
 
